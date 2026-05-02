@@ -529,9 +529,17 @@ impl BedrockWorld {
         &self,
         options: WorldScanOptions,
     ) -> Result<Vec<ChunkPos>> {
+        let started = Instant::now();
+        log::debug!(
+            "listing render chunk positions (threading={:?}, queue_depth={}, progress_interval={})",
+            options.threading,
+            options.pipeline.queue_depth,
+            options.pipeline.progress_interval
+        );
         let mut positions = BTreeSet::new();
         let mut entries_seen = 0usize;
-        self.storage
+        let outcome = self
+            .storage
             .for_each_key(to_storage_read_options(&options), &mut |key| {
                 check_cancelled(&options)?;
                 entries_seen = entries_seen.saturating_add(1);
@@ -545,7 +553,19 @@ impl BedrockWorld {
                 }
                 Ok(StorageVisitorControl::Continue)
             })?;
-        Ok(positions.into_iter().collect())
+        let positions = positions.into_iter().collect::<Vec<_>>();
+        log::debug!(
+            "render chunk position listing complete (entries_seen={}, positions={}, visited={}, tables_scanned={}, worker_threads={}, queue_wait_ms={}, cancel_checks={}, elapsed_ms={})",
+            entries_seen,
+            positions.len(),
+            outcome.visited,
+            outcome.tables_scanned,
+            outcome.worker_threads,
+            outcome.queue_wait_ms,
+            outcome.cancel_checks,
+            started.elapsed().as_millis()
+        );
+        Ok(positions)
     }
 
     pub fn list_render_chunk_positions_in_region_blocking(
@@ -553,6 +573,7 @@ impl BedrockWorld {
         region: RenderChunkRegion,
         options: WorldScanOptions,
     ) -> Result<Vec<ChunkPos>> {
+        let started = Instant::now();
         validate_render_region(region)?;
         let x_count = i64::from(region.max_chunk_x) - i64::from(region.min_chunk_x) + 1;
         let z_count = i64::from(region.max_chunk_z) - i64::from(region.min_chunk_z) + 1;
@@ -583,7 +604,7 @@ impl BedrockWorld {
             worker_count
         );
         if worker_count == 1 {
-            return positions
+            let render_positions = positions
                 .into_iter()
                 .filter_map(
                     |pos| match self.has_render_chunk_records_blocking(pos, &options) {
@@ -592,7 +613,16 @@ impl BedrockWorld {
                         Err(error) => Some(Err(error)),
                     },
                 )
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
+            log::debug!(
+                "render chunk region index complete (dimension={:?}, candidates={}, positions={}, workers={}, queue_depth=0, elapsed_ms={})",
+                region.dimension,
+                capacity,
+                render_positions.len(),
+                worker_count,
+                started.elapsed().as_millis()
+            );
+            return Ok(render_positions);
         }
 
         let scan_options = WorldScanOptions {
@@ -646,6 +676,15 @@ impl BedrockWorld {
                 }
             }
             render_positions.sort();
+            log::debug!(
+                "render chunk region index complete (dimension={:?}, candidates={}, positions={}, workers={}, queue_depth={}, elapsed_ms={})",
+                region.dimension,
+                positions.len(),
+                render_positions.len(),
+                worker_count,
+                queue_depth,
+                started.elapsed().as_millis()
+            );
             Ok(render_positions)
         })
     }
@@ -1068,18 +1107,24 @@ impl BedrockWorld {
         let started = Instant::now();
         let positions = positions.into_iter().collect::<Vec<_>>();
         if positions.is_empty() {
+            log::debug!("loading render chunks skipped (chunks=0)");
             return Ok((Vec::new(), RenderLoadStats::default()));
         }
         let mut positions = positions;
         sort_render_chunk_positions(&mut positions, options.priority);
         let worker_count = options.threading.resolve_checked(positions.len())?;
         log::debug!(
-            "loading render chunks (chunks={}, workers={}, surface={}, fixed_y={:?}, biome_y={:?})",
+            "loading render chunks (chunks={}, workers={}, surface={}, fixed_y={:?}, biome_y={:?}, block_entities={}, queue_depth={}, priority={:?})",
             positions.len(),
             worker_count,
             options.surface,
             options.fixed_y,
-            options.biome_y
+            options.biome_y,
+            options.block_entities,
+            options
+                .pipeline
+                .resolve_queue_depth(worker_count, positions.len()),
+            options.priority
         );
         if worker_count == 1 {
             let mut chunks = Vec::with_capacity(positions.len());
@@ -1091,6 +1136,7 @@ impl BedrockWorld {
                 emit_render_load_progress(&options, completed);
             }
             let stats = render_load_stats(&chunks, worker_count, 0, started.elapsed().as_millis());
+            log_render_load_complete(&stats);
             return Ok((chunks, stats));
         }
 
@@ -1164,6 +1210,7 @@ impl BedrockWorld {
                 u128::from(queue_wait_ms.load(Ordering::Relaxed)),
                 started.elapsed().as_millis(),
             );
+            log_render_load_complete(&stats);
             Ok((chunks, stats))
         })
     }
@@ -1802,6 +1849,19 @@ fn render_load_stats(
         queue_wait_ms,
         load_ms,
     }
+}
+
+fn log_render_load_complete(stats: &RenderLoadStats) {
+    log::debug!(
+        "render chunk load complete (requested_chunks={}, loaded_chunks={}, missing_chunks={}, subchunks_decoded={}, worker_threads={}, queue_wait_ms={}, load_ms={})",
+        stats.requested_chunks,
+        stats.loaded_chunks,
+        stats.requested_chunks.saturating_sub(stats.loaded_chunks),
+        stats.subchunks_decoded,
+        stats.worker_threads,
+        stats.queue_wait_ms,
+        stats.load_ms
+    );
 }
 
 fn world_pool(worker_count: usize) -> Result<rayon::ThreadPool> {
