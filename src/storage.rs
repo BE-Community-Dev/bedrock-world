@@ -30,6 +30,7 @@ pub enum StorageOp {
 pub struct StorageReadOptions {
     pub threading: StorageThreadingOptions,
     pub scan_mode: StorageScanMode,
+    pub pipeline: StoragePipelineOptions,
     pub cancel: Option<StorageCancelFlag>,
     pub progress: Option<StorageProgressSink>,
 }
@@ -39,10 +40,18 @@ impl Default for StorageReadOptions {
         Self {
             threading: StorageThreadingOptions::Auto,
             scan_mode: StorageScanMode::ParallelTables,
+            pipeline: StoragePipelineOptions::default(),
             cancel: None,
             progress: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoragePipelineOptions {
+    pub queue_depth: usize,
+    pub table_batch_size: usize,
+    pub progress_interval: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -71,6 +80,10 @@ pub struct StorageScanOutcome {
     pub visited: usize,
     pub bytes_read: usize,
     pub stopped: bool,
+    pub tables_scanned: usize,
+    pub worker_threads: usize,
+    pub queue_wait_ms: u128,
+    pub cancel_checks: usize,
 }
 
 impl StorageScanOutcome {
@@ -80,6 +93,10 @@ impl StorageScanOutcome {
             visited: 0,
             bytes_read: 0,
             stopped: false,
+            tables_scanned: 0,
+            worker_threads: 0,
+            queue_wait_ms: 0,
+            cancel_checks: 0,
         }
     }
 
@@ -92,6 +109,10 @@ impl StorageScanOutcome {
         self.visited = self.visited.saturating_add(other.visited);
         self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
         self.stopped |= other.stopped;
+        self.tables_scanned = self.tables_scanned.saturating_add(other.tables_scanned);
+        self.worker_threads = self.worker_threads.max(other.worker_threads);
+        self.queue_wait_ms = self.queue_wait_ms.saturating_add(other.queue_wait_ms);
+        self.cancel_checks = self.cancel_checks.saturating_add(other.cancel_checks);
     }
 }
 
@@ -196,20 +217,30 @@ pub trait WorldStorage: Send + Sync {
     fn for_each_key(
         &self,
         options: StorageReadOptions,
-        visitor: &mut dyn FnMut(&[u8]) -> Result<StorageVisitorControl>,
+        visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
     ) -> Result<StorageScanOutcome>;
     /// Visits key/value records whose key starts with `prefix`.
     fn for_each_prefix(
         &self,
         prefix: &[u8],
         options: StorageReadOptions,
-        visitor: &mut dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl>,
+        visitor: &mut (dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl> + Send),
     ) -> Result<StorageScanOutcome>;
+    /// Visits keys whose key starts with `prefix` without requiring value
+    /// materialization when the backend can support key-only scans.
+    fn for_each_prefix_key(
+        &self,
+        prefix: &[u8],
+        options: StorageReadOptions,
+        visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
+    ) -> Result<StorageScanOutcome> {
+        self.for_each_prefix(prefix, options, &mut |key, _value| visitor(key))
+    }
     /// Visits all key/value records.
     fn for_each_entry(
         &self,
         options: StorageReadOptions,
-        visitor: &mut dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl>,
+        visitor: &mut (dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl> + Send),
     ) -> Result<StorageScanOutcome> {
         self.for_each_prefix(b"", options, visitor)
     }
@@ -258,7 +289,7 @@ impl WorldStorage for MemoryStorage {
     fn for_each_key(
         &self,
         options: StorageReadOptions,
-        visitor: &mut dyn FnMut(&[u8]) -> Result<StorageVisitorControl>,
+        visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
     ) -> Result<StorageScanOutcome> {
         let values = self.values.read().map_err(|_| {
             BedrockWorldError::ConcurrentWrite("memory storage poisoned".to_string())
@@ -280,7 +311,7 @@ impl WorldStorage for MemoryStorage {
         &self,
         prefix: &[u8],
         options: StorageReadOptions,
-        visitor: &mut dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl>,
+        visitor: &mut (dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl> + Send),
     ) -> Result<StorageScanOutcome> {
         let values = self.values.read().map_err(|_| {
             BedrockWorldError::ConcurrentWrite("memory storage poisoned".to_string())
@@ -293,6 +324,31 @@ impl WorldStorage for MemoryStorage {
             check_cancelled(&options)?;
             outcome.record(value.len());
             if visitor(key, value)? == StorageVisitorControl::Stop {
+                outcome.stopped = true;
+                return Ok(outcome);
+            }
+            emit_progress(&options, outcome);
+        }
+        Ok(outcome)
+    }
+
+    fn for_each_prefix_key(
+        &self,
+        prefix: &[u8],
+        options: StorageReadOptions,
+        visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
+    ) -> Result<StorageScanOutcome> {
+        let values = self.values.read().map_err(|_| {
+            BedrockWorldError::ConcurrentWrite("memory storage poisoned".to_string())
+        })?;
+        let mut outcome = StorageScanOutcome::empty();
+        for (key, value) in values
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            check_cancelled(&options)?;
+            outcome.record(value.len());
+            if visitor(key)? == StorageVisitorControl::Stop {
                 outcome.stopped = true;
                 return Ok(outcome);
             }
@@ -393,7 +449,7 @@ pub mod backend {
         fn for_each_key(
             &self,
             options: StorageReadOptions,
-            visitor: &mut dyn FnMut(&[u8]) -> Result<StorageVisitorControl>,
+            visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
         ) -> Result<StorageScanOutcome> {
             let read_options = to_leveldb_read_options(options);
             let mut visitor_error = None;
@@ -420,7 +476,7 @@ pub mod backend {
             &self,
             prefix: &[u8],
             options: StorageReadOptions,
-            visitor: &mut dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl>,
+            visitor: &mut (dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl> + Send),
         ) -> Result<StorageScanOutcome> {
             let read_options = to_leveldb_read_options(options);
             let mut visitor_error = None;
@@ -436,6 +492,35 @@ pub mod backend {
                     }
                 }
             });
+            match (scan_result, visitor_error) {
+                (_, Some(error)) => Err(error),
+                (Ok(outcome), None) => Ok(to_storage_outcome(outcome)),
+                (Err(error), None) => Err(map_leveldb_error(error)),
+            }
+        }
+
+        fn for_each_prefix_key(
+            &self,
+            prefix: &[u8],
+            options: StorageReadOptions,
+            visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
+        ) -> Result<StorageScanOutcome> {
+            let read_options = to_leveldb_read_options(options);
+            let mut visitor_error = None;
+            let scan_result =
+                self.db
+                    .for_each_prefix_key(prefix, read_options, |key| match visitor(key) {
+                        Ok(StorageVisitorControl::Continue) => {
+                            Ok(bedrock_leveldb::VisitorControl::Continue)
+                        }
+                        Ok(StorageVisitorControl::Stop) => {
+                            Ok(bedrock_leveldb::VisitorControl::Stop)
+                        }
+                        Err(error) => {
+                            visitor_error = Some(error);
+                            Ok(bedrock_leveldb::VisitorControl::Stop)
+                        }
+                    });
             match (scan_result, visitor_error) {
                 (_, Some(error)) => Err(error),
                 (Ok(outcome), None) => Ok(to_storage_outcome(outcome)),
@@ -488,6 +573,11 @@ pub mod backend {
                 StorageScanMode::Sequential => bedrock_leveldb::ScanMode::Sequential,
                 StorageScanMode::ParallelTables => bedrock_leveldb::ScanMode::ParallelTables,
             },
+            pipeline: bedrock_leveldb::ScanPipelineOptions {
+                queue_depth: options.pipeline.queue_depth,
+                table_batch_size: options.pipeline.table_batch_size,
+                progress_interval: options.pipeline.progress_interval,
+            },
             cancel: options
                 .cancel
                 .map(|cancel| bedrock_leveldb::ScanCancelFlag::from_shared(cancel.0)),
@@ -508,6 +598,10 @@ pub mod backend {
             visited: outcome.visited,
             bytes_read: outcome.bytes_read,
             stopped: outcome.stopped,
+            tables_scanned: outcome.tables_scanned,
+            worker_threads: outcome.worker_threads,
+            queue_wait_ms: outcome.queue_wait_ms,
+            cancel_checks: outcome.cancel_checks,
         }
     }
 
@@ -555,7 +649,7 @@ pub mod backend {
         fn for_each_key(
             &self,
             _options: StorageReadOptions,
-            _visitor: &mut dyn FnMut(&[u8]) -> Result<StorageVisitorControl>,
+            _visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
         ) -> Result<StorageScanOutcome> {
             Err(BedrockWorldError::LevelDb(
                 "backend-bedrock-leveldb feature is disabled".to_string(),
@@ -566,7 +660,7 @@ pub mod backend {
             &self,
             _prefix: &[u8],
             _options: StorageReadOptions,
-            _visitor: &mut dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl>,
+            _visitor: &mut (dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl> + Send),
         ) -> Result<StorageScanOutcome> {
             Err(BedrockWorldError::LevelDb(
                 "backend-bedrock-leveldb feature is disabled".to_string(),

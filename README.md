@@ -28,6 +28,15 @@ behavior reference.
 - Async wrappers use `tokio::task::spawn_blocking`, so disk and decode work does
   not block the foreground async runtime.
 - `WorldScanOptions` controls threading, cancellation, and progress callbacks.
+- `WorldPipelineOptions` refines the bounded pipeline with queue depth, chunk
+  batch size, subchunk decode worker budget, and progress cadence. Zero values
+  choose automatic defaults.
+- Render-specific APIs now have their own fast path:
+  `list_render_chunk_positions_blocking`,
+  `list_render_chunk_positions_in_region_blocking`,
+  `load_render_chunk_blocking`, `load_render_chunks_blocking`, and
+  `load_render_region_blocking`. These only read records needed to render
+  chunks and can run with bounded parallelism.
 - `parse_world_blocking(WorldParseOptions)` is an explicit advanced/offline API,
   not a launcher default path.
 - Public fallible APIs return `bedrock_world::Result<T>`. Match
@@ -80,12 +89,73 @@ keeps counts and structured summaries while avoiding raw value retention.
   `write_level_dat_atomic`; this path touches only `level.dat`.
 - `BedrockWorld::open` is lazy and delegates DB access to `bedrock-leveldb`.
 - Key classification uses key-only scans and does not retain values.
+- Viewport rendering should use
+  `list_render_chunk_positions_in_region_blocking` or its async wrapper before
+  loading render chunks. This probes each visible chunk with key-only prefix
+  scans and skips chunks that have no render records.
 - Chunk parsing uses prefix scans and the LevelDB native block cache; repeated
   sample chunk reads avoid full table scans.
 - Default world scans use automatic bounded parallel table scanning. Use
   `WorldThreadingOptions::Single` for deterministic debugging.
+- `RenderChunkLoadOptions::threading` and `RenderRegionLoadOptions::threading`
+  control parallel render chunk loading. Use `Single` when an outer renderer
+  already owns the worker pool to avoid nested oversubscription.
+- `RenderChunkLoadOptions::priority` can use
+  `RenderChunkPriority::DistanceFrom { chunk_x, chunk_z }` so the current
+  viewport center loads first. `RenderRegionData::stats` reports requested and
+  loaded chunks, decoded subchunks, worker count, queue wait, and total load
+  time.
 - Long scans can be cancelled through `CancelFlag` and can report progress
   through `ProgressSink`.
+
+### Migration: full chunk scan to viewport render index
+
+Old map viewers often waited for a full-world chunk scan before rendering:
+
+```rust
+let all_chunks = world
+    .list_chunk_positions_blocking(WorldScanOptions::default())?;
+let visible = all_chunks
+    .into_iter()
+    .filter(|pos| viewport.contains(*pos))
+    .collect::<Vec<_>>();
+```
+
+Prefer a render-only region query for the current viewport:
+
+```rust
+let visible = world.list_render_chunk_positions_in_region_blocking(
+    bedrock_world::RenderChunkRegion {
+        dimension,
+        min_chunk_x,
+        min_chunk_z,
+        max_chunk_x,
+        max_chunk_z,
+    },
+    WorldScanOptions {
+        threading: WorldThreadingOptions::Auto,
+        cancel: Some(cancel),
+        progress: Some(progress),
+        ..WorldScanOptions::default()
+    },
+)?;
+```
+
+Then load just those chunks for the tile or viewport batch:
+
+```rust
+let chunks = world.load_render_chunks_blocking(
+    visible,
+    bedrock_world::RenderChunkLoadOptions {
+        threading: WorldThreadingOptions::Fixed(4),
+        priority: bedrock_world::RenderChunkPriority::DistanceFrom {
+            chunk_x: viewport_center_x,
+            chunk_z: viewport_center_z,
+        },
+        ..bedrock_world::RenderChunkLoadOptions::default()
+    },
+)?;
+```
 
 ## Fixture Result
 
@@ -174,6 +244,9 @@ outside this crate's current scope.
   safe `level.dat` edits.
 - Use category APIs when only one class of data is required. This avoids parsing
   entities, chunks, and global records unnecessarily.
+- For renderers, build a viewport `RenderChunkRegion` first and use the
+  render-index APIs. Keep full `list_chunk_positions_blocking` for metadata,
+  search, and offline export workflows.
 - This initial GitHub release is marked `publish = false` because
   `bedrock-leveldb` is still consumed by pinned Git revision. Publish
   `bedrock-leveldb` first, then switch this dependency to crates.io before

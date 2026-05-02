@@ -37,9 +37,11 @@ async = ["dep:tokio"]
 backend-bedrock-leveldb = ["dep:bedrock-leveldb"]
 
 [dependencies]
-bedrock-leveldb = { version = "0.1.0", git = "https://github.com/BE-Community-Dev/bedrock-leveldb.git", rev = "ada7bab1d5e9a837691dfb224c67a8a1e242c4b6", optional = true }
+bedrock-leveldb = { path = "../bedrock-leveldb", optional = true }
 bytes = "1.10.1"
 indexmap = { version = "2.12.1", features = ["serde"] }
+log = "0.4"
+rayon = "1.11.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"

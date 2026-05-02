@@ -34,6 +34,59 @@ mode. Use targeted APIs instead of full-world parsing for UI flows:
 Async methods are wrappers over the blocking implementation and use
 `tokio::task::spawn_blocking`.
 
+## Render Index Path
+
+Interactive renderers should not wait for `list_chunk_positions_blocking` before
+painting the first viewport. Use the render-index APIs instead:
+
+- `list_render_chunk_positions_blocking` lists chunks that have render records.
+- `list_render_chunk_positions_in_region_blocking` probes only a viewport or
+  export region using key-only prefix scans.
+- `load_render_chunk_blocking`, `load_render_chunks_blocking`, and
+  `load_render_region_blocking` accept `RenderChunkLoadOptions` /
+  `RenderRegionLoadOptions` with `threading`, `pipeline`, `cancel`,
+  `progress`, and `priority` policies.
+
+Async wrappers with the same names are available behind the default `async`
+feature. They use `spawn_blocking` and preserve cancellation/progress options.
+The blocking implementation uses bounded local parallelism, not Rayon global
+pool state.
+
+```rust
+let region = bedrock_world::RenderChunkRegion {
+    dimension,
+    min_chunk_x: -32,
+    min_chunk_z: -32,
+    max_chunk_x: 31,
+    max_chunk_z: 31,
+};
+let positions = world.list_render_chunk_positions_in_region(
+    region,
+    bedrock_world::WorldScanOptions {
+        pipeline: bedrock_world::WorldPipelineOptions {
+            queue_depth: 64,
+            ..Default::default()
+        },
+        ..Default::default()
+    },
+).await?;
+let chunks = world.load_render_chunks(
+    positions,
+    bedrock_world::RenderChunkLoadOptions {
+        priority: bedrock_world::RenderChunkPriority::DistanceFrom {
+            chunk_x: 0,
+            chunk_z: 0,
+        },
+        ..Default::default()
+    },
+).await?;
+```
+
+`load_render_region_blocking` returns `RenderRegionData { region, chunks, stats }`.
+Use `stats.worker_threads`, `stats.queue_wait_ms`, and
+`stats.subchunks_decoded` to tune worker budgets without baking fixed time
+thresholds into tests.
+
 ## Parsing Modes
 
 `WorldParseOptions::summary()` is the default for large scans. It keeps counters

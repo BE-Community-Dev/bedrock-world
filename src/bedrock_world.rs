@@ -76,8 +76,9 @@ pub use storage::{
     StorageThreadingOptions, StorageVisitorControl, WorldStorage, backend::BedrockLevelDbStorage,
 };
 pub use world::{
-    BedrockWorld, CancelFlag, ChunkBounds, OpenOptions, ProgressSink, RenderChunkData,
-    RenderChunkLoadOptions, RenderChunkRegion, RenderRegionData, RenderRegionLoadOptions,
-    RenderSurfaceSubchunkMode, SurfaceColumn, SurfaceColumnOptions, WorldScanOptions,
-    WorldScanProgress, WorldThreadingOptions, WorldTransaction,
+    BedrockWorld, CancelFlag, ChunkBounds, OpenOptions, ProgressSink, RenderBlockEntity,
+    RenderChunkData, RenderChunkLoadOptions, RenderChunkPriority, RenderChunkRegion,
+    RenderLoadStats, RenderRegionData, RenderRegionLoadOptions, RenderSurfaceSubchunkMode,
+    SurfaceColumn, SurfaceColumnOptions, WorldPipelineOptions, WorldScanOptions, WorldScanProgress,
+    WorldThreadingOptions, WorldTransaction,
 };

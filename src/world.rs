@@ -11,7 +11,7 @@ use crate::chunk::{
 };
 use crate::error::{BedrockWorldError, Result};
 use crate::level_dat::{LevelDatDocument, read_level_dat_document, write_level_dat_document};
-use crate::nbt::parse_root_nbt;
+use crate::nbt::{NbtTag, parse_root_nbt};
 use crate::parsed::{
     ItemStack, ParsedBiomeData, ParsedBiomeStorage, ParsedBlockEntity, ParsedChunkData,
     ParsedDbEntry, ParsedDbValue, ParsedEntity, ParsedGlobalData, ParsedMapData, ParsedVillageData,
@@ -28,13 +28,16 @@ use crate::storage::{
     StorageScanMode, StorageThreadingOptions, StorageVisitorControl, WorldStorage,
 };
 use bytes::Bytes;
+use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
 };
 
@@ -92,14 +95,70 @@ pub enum RenderSurfaceSubchunkMode {
     Needed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorldPipelineOptions {
+    pub queue_depth: usize,
+    pub chunk_batch_size: usize,
+    pub subchunk_decode_workers: usize,
+    pub progress_interval: usize,
+}
+
+impl WorldPipelineOptions {
+    #[must_use]
+    pub fn resolve_queue_depth(self, workers: usize, work_items: usize) -> usize {
+        self.queue_depth
+            .max(if self.queue_depth == 0 {
+                workers
+                    .max(1)
+                    .saturating_mul(2)
+                    .max(work_items.min(256).max(1))
+            } else {
+                1
+            })
+            .max(1)
+    }
+
+    #[must_use]
+    pub fn resolve_progress_interval(self) -> usize {
+        self.progress_interval
+            .max(if self.progress_interval == 0 { 256 } else { 1 })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RenderChunkPriority {
+    #[default]
+    RowMajor,
+    DistanceFrom {
+        chunk_x: i32,
+        chunk_z: i32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderLoadStats {
+    pub requested_chunks: usize,
+    pub loaded_chunks: usize,
+    pub subchunks_decoded: usize,
+    pub worker_threads: usize,
+    pub queue_wait_ms: u128,
+    pub load_ms: u128,
+}
+
+#[derive(Debug, Clone)]
 pub struct RenderChunkLoadOptions {
     pub surface: bool,
     pub surface_subchunks: RenderSurfaceSubchunkMode,
     pub fixed_y: Option<i32>,
     pub biome_y: Option<i32>,
     pub load_all_biomes: bool,
+    pub block_entities: bool,
     pub subchunk_decode: SubChunkDecodeMode,
+    pub threading: WorldThreadingOptions,
+    pub pipeline: WorldPipelineOptions,
+    pub cancel: Option<CancelFlag>,
+    pub progress: Option<ProgressSink>,
+    pub priority: RenderChunkPriority,
 }
 
 impl Default for RenderChunkLoadOptions {
@@ -110,9 +169,22 @@ impl Default for RenderChunkLoadOptions {
             fixed_y: None,
             biome_y: Some(64),
             load_all_biomes: false,
+            block_entities: false,
             subchunk_decode: SubChunkDecodeMode::FullIndices,
+            threading: WorldThreadingOptions::Auto,
+            pipeline: WorldPipelineOptions::default(),
+            cancel: None,
+            progress: None,
+            priority: RenderChunkPriority::RowMajor,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderBlockEntity {
+    pub id: Option<String>,
+    pub position: Option<[i32; 3]>,
+    pub nbt: NbtTag,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,17 +194,24 @@ pub struct RenderChunkData {
     pub height_map: Option<[[Option<i16>; 16]; 16]>,
     pub biome_data: BTreeMap<i32, ParsedBiomeStorage>,
     pub subchunks: BTreeMap<i8, SubChunk>,
+    pub block_entities: Vec<RenderBlockEntity>,
     pub version: crate::ChunkVersion,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RenderRegionLoadOptions {
     pub surface: bool,
     pub surface_subchunks: RenderSurfaceSubchunkMode,
     pub fixed_y: Option<i32>,
     pub biome_y: Option<i32>,
     pub load_all_biomes: bool,
+    pub block_entities: bool,
     pub subchunk_decode: SubChunkDecodeMode,
+    pub threading: WorldThreadingOptions,
+    pub pipeline: WorldPipelineOptions,
+    pub cancel: Option<CancelFlag>,
+    pub progress: Option<ProgressSink>,
+    pub priority: RenderChunkPriority,
 }
 
 impl Default for RenderRegionLoadOptions {
@@ -143,7 +222,13 @@ impl Default for RenderRegionLoadOptions {
             fixed_y: None,
             biome_y: Some(64),
             load_all_biomes: false,
+            block_entities: false,
             subchunk_decode: SubChunkDecodeMode::FullIndices,
+            threading: WorldThreadingOptions::Auto,
+            pipeline: WorldPipelineOptions::default(),
+            cancel: None,
+            progress: None,
+            priority: RenderChunkPriority::RowMajor,
         }
     }
 }
@@ -156,7 +241,13 @@ impl From<RenderRegionLoadOptions> for RenderChunkLoadOptions {
             fixed_y: options.fixed_y,
             biome_y: options.biome_y,
             load_all_biomes: options.load_all_biomes,
+            block_entities: options.block_entities,
             subchunk_decode: options.subchunk_decode,
+            threading: options.threading,
+            pipeline: options.pipeline,
+            cancel: options.cancel,
+            progress: options.progress,
+            priority: options.priority,
         }
     }
 }
@@ -174,6 +265,7 @@ pub struct RenderChunkRegion {
 pub struct RenderRegionData {
     pub region: RenderChunkRegion,
     pub chunks: Vec<RenderChunkData>,
+    pub stats: RenderLoadStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +302,7 @@ impl ChunkBounds {
 #[derive(Debug, Clone)]
 pub struct WorldScanOptions {
     pub threading: WorldThreadingOptions,
+    pub pipeline: WorldPipelineOptions,
     pub cancel: Option<CancelFlag>,
     pub progress: Option<ProgressSink>,
 }
@@ -218,6 +311,7 @@ impl Default for WorldScanOptions {
     fn default() -> Self {
         Self {
             threading: WorldThreadingOptions::Auto,
+            pipeline: WorldPipelineOptions::default(),
             cancel: None,
             progress: None,
         }
@@ -276,6 +370,11 @@ impl CancelFlag {
 
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn from_shared(cancelled: Arc<AtomicBool>) -> Self {
+        Self(cancelled)
     }
 
     #[must_use]
@@ -437,13 +536,7 @@ impl BedrockWorld {
                 check_cancelled(&options)?;
                 entries_seen = entries_seen.saturating_add(1);
                 if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key)
-                    && matches!(
-                        chunk_key.tag,
-                        ChunkRecordTag::Data3D
-                            | ChunkRecordTag::Data2D
-                            | ChunkRecordTag::Data2DLegacy
-                            | ChunkRecordTag::SubChunkPrefix
-                    )
+                    && is_render_chunk_record_tag(chunk_key.tag)
                 {
                     positions.insert(chunk_key.pos);
                 }
@@ -453,6 +546,108 @@ impl BedrockWorld {
                 Ok(StorageVisitorControl::Continue)
             })?;
         Ok(positions.into_iter().collect())
+    }
+
+    pub fn list_render_chunk_positions_in_region_blocking(
+        &self,
+        region: RenderChunkRegion,
+        options: WorldScanOptions,
+    ) -> Result<Vec<ChunkPos>> {
+        validate_render_region(region)?;
+        let x_count = i64::from(region.max_chunk_x) - i64::from(region.min_chunk_x) + 1;
+        let z_count = i64::from(region.max_chunk_z) - i64::from(region.min_chunk_z) + 1;
+        let capacity = usize::try_from(x_count.saturating_mul(z_count))
+            .map_err(|_| BedrockWorldError::Validation("render region is too large".to_string()))?;
+        let mut positions = Vec::with_capacity(capacity);
+        for z in region.min_chunk_z..=region.max_chunk_z {
+            for x in region.min_chunk_x..=region.max_chunk_x {
+                positions.push(ChunkPos {
+                    x,
+                    z,
+                    dimension: region.dimension,
+                });
+            }
+        }
+        if positions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let worker_count = options.threading.resolve_checked(positions.len())?;
+        log::debug!(
+            "indexing render chunk region (dimension={:?}, min=({}, {}), max=({}, {}), workers={})",
+            region.dimension,
+            region.min_chunk_x,
+            region.min_chunk_z,
+            region.max_chunk_x,
+            region.max_chunk_z,
+            worker_count
+        );
+        if worker_count == 1 {
+            return positions
+                .into_iter()
+                .filter_map(
+                    |pos| match self.has_render_chunk_records_blocking(pos, &options) {
+                        Ok(true) => Some(Ok(pos)),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                )
+                .collect();
+        }
+
+        let scan_options = WorldScanOptions {
+            threading: WorldThreadingOptions::Single,
+            pipeline: options.pipeline,
+            cancel: options.cancel.clone(),
+            progress: options.progress.clone(),
+        };
+        let next_position = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue_depth = options
+            .pipeline
+            .resolve_queue_depth(worker_count, positions.len());
+        let (sender, receiver) = mpsc::sync_channel::<Result<Option<ChunkPos>>>(queue_depth);
+        let pool = world_pool(worker_count)?;
+        pool.scope(|scope| {
+            for worker_index in 0..worker_count {
+                let next_position = Arc::clone(&next_position);
+                let sender = sender.clone();
+                let positions = &positions;
+                let scan_options = scan_options.clone();
+                scope.spawn(move |_| {
+                    log::trace!("render region index worker {worker_index} started");
+                    loop {
+                        if scan_options
+                            .cancel
+                            .as_ref()
+                            .is_some_and(CancelFlag::is_cancelled)
+                        {
+                            return;
+                        }
+                        let index = next_position.fetch_add(1, Ordering::Relaxed);
+                        let Some(pos) = positions.get(index).copied() else {
+                            log::trace!("render region index worker {worker_index} finished");
+                            return;
+                        };
+                        let result = self
+                            .has_render_chunk_records_blocking(pos, &scan_options)
+                            .map(|is_renderable| is_renderable.then_some(pos));
+                        if sender.send(result).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+
+            let mut render_positions = Vec::new();
+            for result in receiver {
+                if let Some(pos) = result? {
+                    render_positions.push(pos);
+                }
+            }
+            render_positions.sort();
+            Ok(render_positions)
+        })
     }
 
     pub fn discover_chunk_bounds_blocking(
@@ -661,6 +856,31 @@ impl BedrockWorld {
         Ok(None)
     }
 
+    fn has_render_chunk_records_blocking(
+        &self,
+        pos: ChunkPos,
+        options: &WorldScanOptions,
+    ) -> Result<bool> {
+        let prefix = chunk_record_prefix(pos);
+        let mut found = false;
+        self.storage.for_each_prefix_key(
+            &prefix,
+            to_storage_read_options(options),
+            &mut |key| {
+                check_cancelled(options)?;
+                if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key)
+                    && chunk_key.pos == pos
+                    && is_render_chunk_record_tag(chunk_key.tag)
+                {
+                    found = true;
+                    return Ok(StorageVisitorControl::Stop);
+                }
+                Ok(StorageVisitorControl::Continue)
+            },
+        )?;
+        Ok(found)
+    }
+
     pub fn get_height_at_blocking(
         &self,
         pos: ChunkPos,
@@ -752,6 +972,7 @@ impl BedrockWorld {
         pos: ChunkPos,
         options: RenderChunkLoadOptions,
     ) -> Result<RenderChunkData> {
+        check_render_load_cancelled(&options)?;
         let height_map = self.get_height_map_blocking(pos)?;
         let mut biome_data = BTreeMap::new();
         if options.load_all_biomes {
@@ -792,6 +1013,7 @@ impl BedrockWorld {
 
         let mut subchunks = BTreeMap::new();
         for y in subchunk_ys {
+            check_render_load_cancelled(&options)?;
             if let Some(subchunk) = self.parse_subchunk_blocking(
                 pos,
                 y,
@@ -804,12 +1026,26 @@ impl BedrockWorld {
             }
         }
 
+        let block_entities = if options.block_entities {
+            self.get_chunk_blocking(pos)?
+                .get_block_entities()?
+                .into_iter()
+                .map(|entity| render_block_entity_from_nbt(entity.tag))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(RenderChunkData {
             pos,
-            is_loaded: height_map.is_some() || !biome_data.is_empty() || !subchunks.is_empty(),
+            is_loaded: height_map.is_some()
+                || !biome_data.is_empty()
+                || !subchunks.is_empty()
+                || !block_entities.is_empty(),
             height_map,
             biome_data,
             subchunks,
+            block_entities,
             version: crate::ChunkVersion::New,
         })
     }
@@ -819,10 +1055,117 @@ impl BedrockWorld {
         positions: impl IntoIterator<Item = ChunkPos>,
         options: RenderChunkLoadOptions,
     ) -> Result<Vec<RenderChunkData>> {
-        positions
-            .into_iter()
-            .map(|pos| self.load_render_chunk_blocking(pos, options))
-            .collect()
+        Ok(self
+            .load_render_chunks_with_stats_blocking(positions, options)?
+            .0)
+    }
+
+    fn load_render_chunks_with_stats_blocking(
+        &self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        options: RenderChunkLoadOptions,
+    ) -> Result<(Vec<RenderChunkData>, RenderLoadStats)> {
+        let started = Instant::now();
+        let positions = positions.into_iter().collect::<Vec<_>>();
+        if positions.is_empty() {
+            return Ok((Vec::new(), RenderLoadStats::default()));
+        }
+        let mut positions = positions;
+        sort_render_chunk_positions(&mut positions, options.priority);
+        let worker_count = options.threading.resolve_checked(positions.len())?;
+        log::debug!(
+            "loading render chunks (chunks={}, workers={}, surface={}, fixed_y={:?}, biome_y={:?})",
+            positions.len(),
+            worker_count,
+            options.surface,
+            options.fixed_y,
+            options.biome_y
+        );
+        if worker_count == 1 {
+            let mut chunks = Vec::with_capacity(positions.len());
+            let mut completed = 0usize;
+            for pos in positions {
+                check_render_load_cancelled(&options)?;
+                chunks.push(self.load_render_chunk_blocking(pos, options.clone())?);
+                completed = completed.saturating_add(1);
+                emit_render_load_progress(&options, completed);
+            }
+            let stats = render_load_stats(&chunks, worker_count, 0, started.elapsed().as_millis());
+            return Ok((chunks, stats));
+        }
+
+        let next_position = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue_depth = options
+            .pipeline
+            .resolve_queue_depth(worker_count, positions.len());
+        let queue_wait_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (sender, receiver) =
+            mpsc::sync_channel::<(usize, Result<RenderChunkData>)>(queue_depth);
+        let pool = world_pool(worker_count)?;
+        pool.scope(|scope| {
+            for worker_index in 0..worker_count {
+                let next_position = Arc::clone(&next_position);
+                let sender = sender.clone();
+                let positions = &positions;
+                let options = options.clone();
+                let queue_wait_ms = Arc::clone(&queue_wait_ms);
+                scope.spawn(move |_| {
+                    log::trace!("render chunk load worker {worker_index} started");
+                    loop {
+                        if check_render_load_cancelled(&options).is_err() {
+                            return;
+                        }
+                        let index = next_position.fetch_add(1, Ordering::Relaxed);
+                        let Some(pos) = positions.get(index).copied() else {
+                            log::trace!("render chunk load worker {worker_index} finished");
+                            return;
+                        };
+                        let send_started = Instant::now();
+                        let result = sender
+                            .send((index, self.load_render_chunk_blocking(pos, options.clone())));
+                        queue_wait_ms.fetch_add(
+                            u64::try_from(send_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            Ordering::Relaxed,
+                        );
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+
+            let mut results = Vec::with_capacity(positions.len());
+            results.resize_with(positions.len(), || None);
+            let mut completed = 0usize;
+            for (index, result) in receiver {
+                let slot = results.get_mut(index).ok_or_else(|| {
+                    BedrockWorldError::Validation(
+                        "render chunk worker returned an invalid index".to_string(),
+                    )
+                })?;
+                *slot = Some(result);
+                completed = completed.saturating_add(1);
+                emit_render_load_progress(&options, completed);
+            }
+            let chunks = results
+                .into_iter()
+                .map(|result| {
+                    result.ok_or_else(|| {
+                        BedrockWorldError::Validation(
+                            "render chunk worker did not return a result".to_string(),
+                        )
+                    })?
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let stats = render_load_stats(
+                &chunks,
+                worker_count,
+                u128::from(queue_wait_ms.load(Ordering::Relaxed)),
+                started.elapsed().as_millis(),
+            );
+            Ok((chunks, stats))
+        })
     }
 
     pub fn load_render_region_blocking(
@@ -850,8 +1193,13 @@ impl BedrockWorld {
                 });
             }
         }
-        let chunks = self.load_render_chunks_blocking(positions, options.into())?;
-        Ok(RenderRegionData { region, chunks })
+        let (chunks, stats) =
+            self.load_render_chunks_with_stats_blocking(positions, options.into())?;
+        Ok(RenderRegionData {
+            region,
+            chunks,
+            stats,
+        })
     }
 
     pub fn get_block_state_at_blocking(
@@ -1114,6 +1462,31 @@ impl BedrockWorld {
     }
 
     #[cfg(feature = "async")]
+    pub async fn list_render_chunk_positions(
+        &self,
+        options: WorldScanOptions,
+    ) -> Result<Vec<ChunkPos>> {
+        let world = self.blocking_clone();
+        tokio::task::spawn_blocking(move || world.list_render_chunk_positions_blocking(options))
+            .await
+            .map_err(|error| BedrockWorldError::Join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn list_render_chunk_positions_in_region(
+        &self,
+        region: RenderChunkRegion,
+        options: WorldScanOptions,
+    ) -> Result<Vec<ChunkPos>> {
+        let world = self.blocking_clone();
+        tokio::task::spawn_blocking(move || {
+            world.list_render_chunk_positions_in_region_blocking(region, options)
+        })
+        .await
+        .map_err(|error| BedrockWorldError::Join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
     pub async fn discover_chunk_bounds(
         &self,
         dimension: crate::Dimension,
@@ -1156,6 +1529,42 @@ impl BedrockWorld {
     ) -> Result<ParsedChunkData> {
         let world = self.blocking_clone();
         tokio::task::spawn_blocking(move || world.parse_chunk_with_options_blocking(pos, options))
+            .await
+            .map_err(|error| BedrockWorldError::Join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn load_render_chunk(
+        &self,
+        pos: ChunkPos,
+        options: RenderChunkLoadOptions,
+    ) -> Result<RenderChunkData> {
+        let world = self.blocking_clone();
+        tokio::task::spawn_blocking(move || world.load_render_chunk_blocking(pos, options))
+            .await
+            .map_err(|error| BedrockWorldError::Join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn load_render_chunks(
+        &self,
+        positions: Vec<ChunkPos>,
+        options: RenderChunkLoadOptions,
+    ) -> Result<Vec<RenderChunkData>> {
+        let world = self.blocking_clone();
+        tokio::task::spawn_blocking(move || world.load_render_chunks_blocking(positions, options))
+            .await
+            .map_err(|error| BedrockWorldError::Join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn load_render_region(
+        &self,
+        region: RenderChunkRegion,
+        options: RenderRegionLoadOptions,
+    ) -> Result<RenderRegionData> {
+        let world = self.blocking_clone();
+        tokio::task::spawn_blocking(move || world.load_render_region_blocking(region, options))
             .await
             .map_err(|error| BedrockWorldError::Join(error.to_string()))?
     }
@@ -1337,6 +1746,74 @@ fn emit_progress(options: &WorldScanOptions, entries_seen: usize) {
     }
 }
 
+fn check_render_load_cancelled(options: &RenderChunkLoadOptions) -> Result<()> {
+    if options
+        .cancel
+        .as_ref()
+        .is_some_and(CancelFlag::is_cancelled)
+    {
+        return Err(BedrockWorldError::Cancelled {
+            operation: "render chunk load",
+        });
+    }
+    Ok(())
+}
+
+fn emit_render_load_progress(options: &RenderChunkLoadOptions, completed_chunks: usize) {
+    if completed_chunks.is_multiple_of(options.pipeline.resolve_progress_interval())
+        && let Some(progress) = &options.progress
+    {
+        progress.emit(WorldScanProgress {
+            entries_seen: completed_chunks,
+        });
+    }
+}
+
+fn sort_render_chunk_positions(positions: &mut [ChunkPos], priority: RenderChunkPriority) {
+    match priority {
+        RenderChunkPriority::RowMajor => positions.sort(),
+        RenderChunkPriority::DistanceFrom { chunk_x, chunk_z } => positions.sort_by_key(|pos| {
+            let dx = i64::from(pos.x) - i64::from(chunk_x);
+            let dz = i64::from(pos.z) - i64::from(chunk_z);
+            (
+                dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz)),
+                pos.z,
+                pos.x,
+                pos.dimension,
+            )
+        }),
+    }
+}
+
+fn render_load_stats(
+    chunks: &[RenderChunkData],
+    worker_threads: usize,
+    queue_wait_ms: u128,
+    load_ms: u128,
+) -> RenderLoadStats {
+    RenderLoadStats {
+        requested_chunks: chunks.len(),
+        loaded_chunks: chunks.iter().filter(|chunk| chunk.is_loaded).count(),
+        subchunks_decoded: chunks
+            .iter()
+            .map(|chunk| chunk.subchunks.len())
+            .sum::<usize>(),
+        worker_threads,
+        queue_wait_ms,
+        load_ms,
+    }
+}
+
+fn world_pool(worker_count: usize) -> Result<rayon::ThreadPool> {
+    ThreadPoolBuilder::new()
+        .num_threads(worker_count.max(1).saturating_add(1))
+        .thread_name(|index| format!("bedrock-world-worker-{index}"))
+        .build()
+        .map_err(|error| {
+            BedrockWorldError::Validation(format!("failed to build world worker pool: {error}"))
+        })
+}
+
 fn to_storage_read_options(options: &WorldScanOptions) -> StorageReadOptions {
     StorageReadOptions {
         threading: match options.threading {
@@ -1349,6 +1826,11 @@ fn to_storage_read_options(options: &WorldScanOptions) -> StorageReadOptions {
             WorldThreadingOptions::Auto | WorldThreadingOptions::Fixed(_) => {
                 StorageScanMode::ParallelTables
             }
+        },
+        pipeline: crate::storage::StoragePipelineOptions {
+            queue_depth: options.pipeline.queue_depth,
+            table_batch_size: options.pipeline.chunk_batch_size,
+            progress_interval: options.pipeline.progress_interval,
         },
         cancel: options
             .cancel
@@ -1377,6 +1859,66 @@ fn chunk_record_prefix(pos: ChunkPos) -> Bytes {
         bytes.extend_from_slice(&pos.dimension.id().to_le_bytes());
     }
     Bytes::from(bytes)
+}
+
+fn validate_render_region(region: RenderChunkRegion) -> Result<()> {
+    if region.min_chunk_x > region.max_chunk_x || region.min_chunk_z > region.max_chunk_z {
+        return Err(BedrockWorldError::Validation(format!(
+            "invalid render region: min=({}, {}) max=({}, {})",
+            region.min_chunk_x, region.min_chunk_z, region.max_chunk_x, region.max_chunk_z
+        )));
+    }
+    Ok(())
+}
+
+fn render_block_entity_from_nbt(nbt: NbtTag) -> RenderBlockEntity {
+    let root = match &nbt {
+        NbtTag::Compound(root) => Some(root),
+        _ => None,
+    };
+    RenderBlockEntity {
+        id: root
+            .and_then(|root| nbt_string_field(root, "id"))
+            .map(ToString::to_string),
+        position: root.and_then(|root| {
+            Some([
+                nbt_int_field(root, "x")?,
+                nbt_int_field(root, "y")?,
+                nbt_int_field(root, "z")?,
+            ])
+        }),
+        nbt,
+    }
+}
+
+fn nbt_string_field<'a>(
+    root: &'a indexmap::IndexMap<String, NbtTag>,
+    key: &str,
+) -> Option<&'a str> {
+    match root.get(key) {
+        Some(NbtTag::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn nbt_int_field(root: &indexmap::IndexMap<String, NbtTag>, key: &str) -> Option<i32> {
+    match root.get(key) {
+        Some(NbtTag::Byte(value)) => Some(i32::from(*value)),
+        Some(NbtTag::Short(value)) => Some(i32::from(*value)),
+        Some(NbtTag::Int(value)) => Some(*value),
+        Some(NbtTag::Long(value)) => i32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+const fn is_render_chunk_record_tag(tag: ChunkRecordTag) -> bool {
+    matches!(
+        tag,
+        ChunkRecordTag::Data3D
+            | ChunkRecordTag::Data2D
+            | ChunkRecordTag::Data2DLegacy
+            | ChunkRecordTag::SubChunkPrefix
+    )
 }
 
 #[cfg(test)]
@@ -1410,6 +1952,62 @@ mod tests {
                 .resolve_checked(10)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn render_chunk_priority_distance_orders_from_center() {
+        let mut positions = vec![
+            ChunkPos {
+                x: 12,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            ChunkPos {
+                x: 1,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            ChunkPos {
+                x: -3,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            ChunkPos {
+                x: 0,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+        ];
+
+        sort_render_chunk_positions(
+            &mut positions,
+            RenderChunkPriority::DistanceFrom {
+                chunk_x: 0,
+                chunk_z: 0,
+            },
+        );
+
+        let ordered = positions
+            .iter()
+            .map(|pos| (pos.x, pos.z))
+            .collect::<Vec<_>>();
+        assert_eq!(ordered, vec![(0, 0), (1, 0), (-3, 0), (12, 0)]);
+    }
+
+    #[test]
+    fn world_pipeline_options_resolve_automatic_bounds() {
+        let options = WorldPipelineOptions::default();
+
+        assert!(options.resolve_queue_depth(4, 64) >= 1);
+        assert_eq!(options.resolve_progress_interval(), 256);
+
+        let explicit = WorldPipelineOptions {
+            queue_depth: 7,
+            progress_interval: 9,
+            ..WorldPipelineOptions::default()
+        };
+        assert_eq!(explicit.resolve_queue_depth(4, 64), 7);
+        assert_eq!(explicit.resolve_progress_interval(), 9);
     }
 
     #[test]
@@ -1536,6 +2134,50 @@ mod tests {
     }
 
     #[test]
+    fn render_chunk_loads_block_entities_when_requested() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        let block_entity = NbtTag::Compound(IndexMap::from([
+            ("id".to_string(), NbtTag::String("Banner".to_string())),
+            ("x".to_string(), NbtTag::Int(3)),
+            ("y".to_string(), NbtTag::Int(65)),
+            ("z".to_string(), NbtTag::Int(4)),
+        ]));
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::BlockEntity).encode(),
+                &crate::nbt::serialize_root_nbt(&block_entity).expect("serialize block entity"),
+            )
+            .expect("put block entity");
+        let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
+
+        let without_entities = world
+            .load_render_chunk_blocking(pos, RenderChunkLoadOptions::default())
+            .expect("load render chunk without block entities");
+        let with_entities = world
+            .load_render_chunk_blocking(
+                pos,
+                RenderChunkLoadOptions {
+                    block_entities: true,
+                    ..RenderChunkLoadOptions::default()
+                },
+            )
+            .expect("load render chunk with block entities");
+
+        assert!(without_entities.block_entities.is_empty());
+        assert_eq!(with_entities.block_entities.len(), 1);
+        assert_eq!(
+            with_entities.block_entities[0].id.as_deref(),
+            Some("Banner")
+        );
+        assert_eq!(with_entities.block_entities[0].position, Some([3, 65, 4]));
+    }
+
+    #[test]
     fn surface_column_query_returns_top_block_and_water_context() {
         let pos = ChunkPos {
             x: 0,
@@ -1618,6 +2260,92 @@ mod tests {
             .expect("nearest chunk");
         assert_eq!(nearest.x, 2);
         assert_eq!(nearest.z, -1);
+    }
+
+    #[test]
+    fn render_region_index_uses_key_only_scan_and_parallel_load_keeps_order() {
+        let storage = Arc::new(MemoryStorage::new());
+        let render_positions = [
+            ChunkPos {
+                x: 0,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            ChunkPos {
+                x: 1,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+        ];
+        for pos in render_positions {
+            storage
+                .put(
+                    &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                    &test_data2d_bytes(64, 3),
+                )
+                .expect("put render chunk");
+        }
+        storage
+            .put(
+                &ChunkKey::new(
+                    ChunkPos {
+                        x: 2,
+                        z: 0,
+                        dimension: Dimension::Overworld,
+                    },
+                    ChunkRecordTag::Version,
+                )
+                .encode(),
+                &[1],
+            )
+            .expect("put non-render chunk");
+        storage
+            .put(
+                &ChunkKey::new(
+                    ChunkPos {
+                        x: 0,
+                        z: 0,
+                        dimension: Dimension::Nether,
+                    },
+                    ChunkRecordTag::Data2D,
+                )
+                .encode(),
+                &test_data2d_bytes(64, 3),
+            )
+            .expect("put nether chunk");
+
+        let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
+        let visible = world
+            .list_render_chunk_positions_in_region_blocking(
+                RenderChunkRegion {
+                    dimension: Dimension::Overworld,
+                    min_chunk_x: 0,
+                    min_chunk_z: 0,
+                    max_chunk_x: 2,
+                    max_chunk_z: 0,
+                },
+                WorldScanOptions {
+                    threading: WorldThreadingOptions::Fixed(2),
+                    ..WorldScanOptions::default()
+                },
+            )
+            .expect("render region index");
+
+        assert_eq!(visible, render_positions.to_vec());
+
+        let chunks = world
+            .load_render_chunks_blocking(
+                visible,
+                RenderChunkLoadOptions {
+                    threading: WorldThreadingOptions::Fixed(2),
+                    ..RenderChunkLoadOptions::default()
+                },
+            )
+            .expect("parallel render chunk load");
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.pos).collect::<Vec<_>>(),
+            render_positions.to_vec()
+        );
     }
 
     fn test_surface_subchunk_bytes() -> Vec<u8> {
