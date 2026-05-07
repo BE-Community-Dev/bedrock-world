@@ -8,11 +8,13 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
     name: Publish crate
     runs-on: ubuntu-latest
+    environment: release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -59,9 +61,10 @@ jobs:
         run: cargo rustdoc --all-features -- -D missing_docs
       - name: Dry run
         run: cargo publish --dry-run
-      # Publishing is intentionally disabled until the release owner configures
-      # crates.io publishing outside this repository.
-      # - name: Publish
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      #   run: cargo publish --no-verify
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --no-verify
