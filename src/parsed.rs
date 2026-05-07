@@ -7,12 +7,13 @@
 //! a full-world scan.
 
 use crate::chunk::{
-    BedrockDbKey, ChunkPos, ChunkRecord, ChunkRecordTag, ChunkVersion, LegacyTerrain,
-    ParsedVillageKey, SubChunk, SubChunkDecodeMode, SubChunkFormat, parse_subchunk_with_mode,
+    ActorUid, BedrockDbKey, ChunkPos, ChunkRecord, ChunkRecordTag, ChunkVersion, GlobalRecordKind,
+    LegacyTerrain, MapRecordId, ParsedVillageKey, SubChunk, SubChunkDecodeMode, SubChunkFormat,
+    parse_subchunk_with_mode,
 };
-use crate::error::Result as WorldResult;
+use crate::error::{BedrockWorldError, Result as WorldResult};
 use crate::level_dat::LevelDatDocument;
-use crate::nbt::{NbtTag, parse_consecutive_root_nbt, parse_root_nbt};
+use crate::nbt::{NbtTag, parse_consecutive_root_nbt, parse_root_nbt, serialize_root_nbt};
 use crate::storage::{StorageReadOptions, StorageVisitorControl, WorldStorage};
 use bytes::Bytes;
 use indexmap::IndexMap;
@@ -253,6 +254,28 @@ pub struct ParsedActorDigest {
     pub missing_actor_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+/// Source record used to load an actor.
+pub enum ActorSource {
+    /// Legacy inline `Entity` chunk record.
+    InlineChunk(crate::ChunkKey),
+    /// Modern `actorprefix<uid>` record referenced by a `digp` digest.
+    ActorPrefix(ActorUid),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Parsed actor plus the storage record that produced it.
+pub struct ActorRecord {
+    /// Actor UID when one is available from the key or entity NBT.
+    pub uid: Option<ActorUid>,
+    /// Storage source for the actor payload.
+    pub source: ActorSource,
+    /// Parsed entity view.
+    pub entity: ParsedEntity,
+    /// Raw actor payload bytes for roundtrip preservation.
+    pub raw: Bytes,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedBiomeData {
     pub version: ChunkVersion,
@@ -270,6 +293,11 @@ pub struct ParsedBiomeStorage {
 
 impl ParsedBiomeStorage {
     #[must_use]
+    /// Returns a palette index at local subchunk coordinates.
+    ///
+    /// For 3D biome storage the index order is Bedrock's X-major
+    /// `x * 256 + z * 16 + y` order. For old 2D storage the index is the
+    /// horizontal `z * 16 + x` column order.
     pub fn palette_index_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u16> {
         if local_x >= 16 || local_y >= 16 || local_z >= 16 {
             return None;
@@ -283,33 +311,268 @@ impl ParsedBiomeStorage {
     }
 
     #[must_use]
+    /// Returns the biome id at local subchunk coordinates.
     pub fn biome_id_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u32> {
         let palette_index = usize::from(self.palette_index_at(local_x, local_y, local_z)?);
         self.palette.get(palette_index).copied()
     }
 }
 
+impl HeightMap2d {
+    /// Creates a 16x16 column height map.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BedrockWorldError::Validation`] when `values` does not contain
+    /// exactly 256 entries.
+    pub fn new(values: Vec<i16>) -> WorldResult<Self> {
+        if values.len() != 256 {
+            return Err(BedrockWorldError::Validation(format!(
+                "height map must contain 256 values, got {}",
+                values.len()
+            )));
+        }
+        Ok(Self { values })
+    }
+
+    /// Parses the 512-byte little-endian height map prefix used by Data2D/Data3D.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors for truncated input.
+    pub fn from_bytes(bytes: &[u8]) -> WorldResult<Self> {
+        read_height_map(bytes)
+            .map(|values| Self { values })
+            .map_err(BedrockWorldError::Validation)
+    }
+
+    #[must_use]
+    /// Serializes this height map as 256 little-endian `i16` values.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(512);
+        for value in &self.values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[must_use]
+    /// Returns a height at local chunk coordinates.
+    pub fn get(&self, local_x: u8, local_z: u8) -> Option<i16> {
+        if local_x >= 16 || local_z >= 16 {
+            return None;
+        }
+        self.values
+            .get(usize::from(local_z) * 16 + usize::from(local_x))
+            .copied()
+    }
+}
+
+impl Biome2d {
+    /// Creates a legacy `Data2D` record model.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors unless both the height map and biome map have
+    /// exactly 256 entries.
+    pub fn new(height_map: Vec<i16>, biomes: Vec<u8>) -> WorldResult<Self> {
+        HeightMap2d::new(height_map.clone())?;
+        if biomes.len() != 256 {
+            return Err(BedrockWorldError::Validation(format!(
+                "2D biome map must contain 256 values, got {}",
+                biomes.len()
+            )));
+        }
+        Ok(Self { height_map, biomes })
+    }
+
+    /// Parses the `Data2D` payload layout: 512 height-map bytes plus 256 biome ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors for truncated or malformed input.
+    pub fn parse(bytes: &[u8]) -> WorldResult<Self> {
+        if bytes.len() < 768 {
+            return Err(BedrockWorldError::Validation(format!(
+                "Data2D is too short: {}",
+                bytes.len()
+            )));
+        }
+        Self::new(
+            read_height_map(&bytes[..512]).map_err(BedrockWorldError::Validation)?,
+            bytes[512..768].to_vec(),
+        )
+    }
+
+    /// Serializes this model to the `Data2D` payload layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors if the in-memory vectors have invalid lengths.
+    pub fn encode(&self) -> WorldResult<Vec<u8>> {
+        Self::new(self.height_map.clone(), self.biomes.clone())?;
+        let mut bytes = HeightMap2d {
+            values: self.height_map.clone(),
+        }
+        .to_bytes();
+        bytes.extend_from_slice(&self.biomes);
+        Ok(bytes)
+    }
+}
+
+impl Biome3d {
+    /// Creates a `Data3D` model from a height map and biome storages.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors unless the height map has exactly 256 entries.
+    pub fn new(height_map: Vec<i16>, storages: Vec<ParsedBiomeStorage>) -> WorldResult<Self> {
+        HeightMap2d::new(height_map.clone())?;
+        Ok(Self {
+            height_map,
+            storages,
+        })
+    }
+
+    /// Parses a `Data3D` payload with a height map followed by biome storages.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors for truncated or malformed biome storage data.
+    pub fn parse(bytes: &[u8]) -> WorldResult<Self> {
+        let parsed = parse_data3d(bytes).map_err(BedrockWorldError::Validation)?;
+        Self::new(parsed.height_map, parsed.storages)
+    }
+
+    /// Serializes this model to a `Data3D` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors if height map or biome storage data is invalid.
+    pub fn encode(&self) -> WorldResult<Vec<u8>> {
+        Self::new(self.height_map.clone(), self.storages.clone())?;
+        let mut bytes = HeightMap2d {
+            values: self.height_map.clone(),
+        }
+        .to_bytes();
+        for storage in &self.storages {
+            bytes.extend_from_slice(&encode_biome_storage(storage)?);
+        }
+        Ok(bytes)
+    }
+}
+
+impl HardcodedSpawnAreaKind {
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        match self {
+            Self::NetherFortress => 1,
+            Self::SwampHut => 2,
+            Self::OceanMonument => 3,
+            Self::PillagerOutpost => 5,
+            Self::Unknown(value) => value,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_byte(value: u8) -> Self {
+        match value {
+            1 => Self::NetherFortress,
+            2 => Self::SwampHut,
+            3 => Self::OceanMonument,
+            5 => Self::PillagerOutpost,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+impl ParsedHardcodedSpawnArea {
+    pub fn validate(&self) -> WorldResult<()> {
+        for axis in 0..3 {
+            if self.min[axis] > self.max[axis] {
+                return Err(BedrockWorldError::Validation(format!(
+                    "HSA min axis {axis} exceeds max"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Hardcoded spawn area record decoded from chunk tag `0x39`.
 pub struct ParsedHardcodedSpawnArea {
+    /// Spawn area structure kind.
     pub kind: HardcodedSpawnAreaKind,
+    /// Inclusive minimum `[x, y, z]` bounds.
     pub min: [i32; 3],
+    /// Inclusive maximum `[x, y, z]` bounds.
     pub max: [i32; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Known hardcoded spawn area kind, preserving unknown tag values.
 pub enum HardcodedSpawnAreaKind {
+    /// Nether fortress spawn area.
     NetherFortress,
+    /// Swamp hut spawn area.
     SwampHut,
+    /// Ocean monument spawn area.
     OceanMonument,
+    /// Pillager outpost spawn area.
     PillagerOutpost,
+    /// Unknown byte value preserved for roundtrip.
     Unknown(u8),
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Typed map record with decoded NBT roots and optional pixel buffer.
 pub struct ParsedMapData {
+    /// Legacy string id, kept for callers that consumed the v0.1 field.
     pub id: String,
+    /// Validated storage id without the `map_` prefix.
+    pub record_id: MapRecordId,
+    /// Consecutive NBT roots stored in the map value.
     pub roots: Vec<NbtTag>,
+    /// Common map fields extracted from NBT when present.
+    pub known_fields: MapKnownFields,
+    /// Decoded map color buffer when width, height, and color bytes are present.
+    pub pixels: Option<MapPixels>,
+    /// Raw value bytes for lossless preservation.
     pub raw: Bytes,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Common map NBT fields recognized by this crate.
+pub struct MapKnownFields {
+    /// Dimension id containing the map center.
+    pub dimension: Option<i32>,
+    /// World X coordinate of the map center.
+    pub center_x: Option<i32>,
+    /// World Z coordinate of the map center.
+    pub center_z: Option<i32>,
+    /// Bedrock map scale.
+    pub scale: Option<i32>,
+    /// Pixel width recorded in NBT.
+    pub width: Option<i32>,
+    /// Pixel height recorded in NBT.
+    pub height: Option<i32>,
+    /// Lock state when recorded by the map NBT.
+    pub locked: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Raw map color buffer.
+///
+/// The core crate intentionally exposes bytes only and does not depend on PNG
+/// or image encoders by default.
+pub struct MapPixels {
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Bedrock map color indices in row-major order.
+    pub colors: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,10 +583,72 @@ pub struct ParsedVillageData {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Typed global record preserving the original NBT payload.
 pub struct ParsedGlobalData {
+    /// Canonical key name used for storage.
     pub name: String,
+    /// Classified global record kind.
+    pub kind: GlobalRecordKind,
+    /// Consecutive NBT roots stored in the value.
     pub roots: Vec<NbtTag>,
+    /// Raw value bytes for roundtrip preservation.
     pub raw: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Parsed block entity with its chunk and order in the consecutive NBT payload.
+pub struct BlockEntityRecord {
+    /// Chunk containing the block entity.
+    pub chunk: ChunkPos,
+    /// Zero-based index in the chunk's `BlockEntity` payload.
+    pub index: usize,
+    /// Parsed block entity.
+    pub entity: ParsedBlockEntity,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Bedrock 16x16 height map decoded from Data2D/Data3D.
+pub struct HeightMap2d {
+    /// Heights in `z * 16 + x` column order.
+    pub values: Vec<i16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Legacy `Data2D` height map plus 2D biome ids.
+pub struct Biome2d {
+    /// Heights in `z * 16 + x` column order.
+    pub height_map: Vec<i16>,
+    /// Biome ids in `z * 16 + x` column order.
+    pub biomes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Data3D` height map plus one or more biome storages.
+pub struct Biome3d {
+    /// Heights in `z * 16 + x` column order.
+    pub height_map: Vec<i16>,
+    /// 3D biome storages preserving palette/index/count decode mode output.
+    pub storages: Vec<ParsedBiomeStorage>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Raw chunk records grouped by tag for format-complete tooling.
+pub struct ChunkRecordSet {
+    /// Chunk represented by this record set.
+    pub pos: ChunkPos,
+    /// Records keyed by Bedrock chunk tag; repeated tags are preserved in order.
+    pub records: BTreeMap<ChunkRecordTag, Vec<ChunkRecord>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Parsed chunk model retaining both structured and unknown/raw records.
+pub struct ChunkModel {
+    /// Chunk represented by this model.
+    pub pos: ChunkPos,
+    /// Structured records decoded by this crate.
+    pub records: Vec<ParsedChunkRecord>,
+    /// Records not decoded by the selected parser mode.
+    pub unknown_records: Vec<ChunkRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -528,6 +853,7 @@ fn should_parse_key(key: &BedrockDbKey, categories: WorldParseCategories) -> boo
         BedrockDbKey::ActorPrefix { .. } | BedrockDbKey::ActorDigest { .. } => categories.actors,
         BedrockDbKey::Map(_) => categories.maps,
         BedrockDbKey::Village(_) => categories.villages,
+        BedrockDbKey::Global(_) => categories.globals,
         BedrockDbKey::PlainString(name) if should_try_nbt_plain_key(name) => categories.globals,
         _ => false,
     }
@@ -554,6 +880,7 @@ fn parse_entry_value(
         }
         BedrockDbKey::Map(id) => parse_map_value(id, value, report),
         BedrockDbKey::Village(village) => parse_village_value(village, value, report),
+        BedrockDbKey::Global(kind) => parse_global_value(&kind.name(), value, report),
         BedrockDbKey::PlainString(name) if should_try_nbt_plain_key(name) => {
             parse_global_value(name, value, report)
         }
@@ -740,9 +1067,14 @@ fn parse_map_value(id: &str, value: &Bytes, report: &mut WorldParseReport) -> Pa
         report.warnings.push(format!("map_{id} kept raw: {error}"));
         Vec::new()
     });
+    let known_fields = map_known_fields(&roots);
+    let pixels = map_pixels(&roots);
     ParsedDbValue::MapData(ParsedMapData {
         id: id.to_string(),
+        record_id: MapRecordId::unchecked(id.to_string()),
         roots,
+        known_fields,
+        pixels,
         raw: value.clone(),
     })
 }
@@ -773,6 +1105,8 @@ fn parse_global_value(name: &str, value: &Bytes, report: &mut WorldParseReport) 
             report.other_nbt_root_count += tags.len();
             ParsedDbValue::GlobalData(ParsedGlobalData {
                 name: name.to_string(),
+                kind: GlobalRecordKind::from_key(name.as_bytes())
+                    .unwrap_or_else(|| GlobalRecordKind::Other(name.to_string())),
                 roots: tags,
                 raw: value.clone(),
             })
@@ -783,6 +1117,103 @@ fn parse_global_value(name: &str, value: &Bytes, report: &mut WorldParseReport) 
             ParsedDbValue::Raw(value.clone())
         }
     }
+}
+
+pub fn parse_map_record(id: MapRecordId, value: Bytes) -> WorldResult<ParsedMapData> {
+    let roots = parse_consecutive_root_nbt(&value)?;
+    Ok(ParsedMapData {
+        id: id.to_string(),
+        record_id: id,
+        known_fields: map_known_fields(&roots),
+        pixels: map_pixels(&roots),
+        roots,
+        raw: value,
+    })
+}
+
+pub fn encode_map_record(record: &ParsedMapData) -> WorldResult<Bytes> {
+    encode_consecutive_roots(&record.roots)
+}
+
+pub fn parse_global_record(
+    kind: GlobalRecordKind,
+    name: String,
+    value: Bytes,
+) -> WorldResult<ParsedGlobalData> {
+    let roots = parse_consecutive_root_nbt(&value)?;
+    Ok(ParsedGlobalData {
+        name,
+        kind,
+        roots,
+        raw: value,
+    })
+}
+
+pub fn encode_global_record(record: &ParsedGlobalData) -> WorldResult<Bytes> {
+    encode_consecutive_roots(&record.roots)
+}
+
+pub fn parse_actor_digest_ids(value: &[u8]) -> WorldResult<Vec<ActorUid>> {
+    if !value.len().is_multiple_of(8) {
+        return Err(BedrockWorldError::CorruptWorld(format!(
+            "actor digest value length {} is not a multiple of 8",
+            value.len()
+        )));
+    }
+    let mut actor_ids = Vec::with_capacity(value.len() / 8);
+    for actor_id_bytes in value.chunks_exact(8) {
+        let mut actor_id_array = [0_u8; 8];
+        actor_id_array.copy_from_slice(actor_id_bytes);
+        actor_ids.push(ActorUid(i64::from_le_bytes(actor_id_array)));
+    }
+    Ok(actor_ids)
+}
+
+pub fn encode_actor_digest_ids(actor_ids: &[ActorUid]) -> Bytes {
+    let mut bytes = Vec::with_capacity(actor_ids.len() * 8);
+    for actor_id in actor_ids {
+        bytes.extend_from_slice(&actor_id.0.to_le_bytes());
+    }
+    Bytes::from(bytes)
+}
+
+pub fn parse_hardcoded_spawn_area_records(
+    value: &[u8],
+) -> WorldResult<Vec<ParsedHardcodedSpawnArea>> {
+    read_hardcoded_spawn_areas(value).map_err(BedrockWorldError::Validation)
+}
+
+pub fn encode_hardcoded_spawn_area_records(
+    areas: &[ParsedHardcodedSpawnArea],
+) -> WorldResult<Bytes> {
+    let count = i32::try_from(areas.len())
+        .map_err(|_| BedrockWorldError::Validation("too many hardcoded spawn areas".to_string()))?;
+    let mut bytes = Vec::with_capacity(4 + areas.len() * 25);
+    bytes.extend_from_slice(&count.to_le_bytes());
+    for area in areas {
+        area.validate()?;
+        for value in area.min {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in area.max {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.push(area.kind.byte());
+    }
+    Ok(Bytes::from(bytes))
+}
+
+pub fn encode_consecutive_roots(roots: &[NbtTag]) -> WorldResult<Bytes> {
+    if roots.is_empty() {
+        return Err(BedrockWorldError::Validation(
+            "record must contain at least one root NBT compound".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    for root in roots {
+        bytes.extend_from_slice(&serialize_root_nbt(root)?);
+    }
+    Ok(Bytes::from(bytes))
 }
 
 fn parse_player_value(
@@ -813,6 +1244,68 @@ fn parse_player_value(
             ParsedDbValue::Raw(value.clone())
         }
     }
+}
+
+fn map_known_fields(roots: &[NbtTag]) -> MapKnownFields {
+    let Some(root) = roots.first().and_then(compound) else {
+        return MapKnownFields::default();
+    };
+    MapKnownFields {
+        dimension: int_field_any(
+            root,
+            &["dimension", "dimensionId", "Dimension", "DimensionId"],
+        ),
+        center_x: int_field_any(root, &["xCenter", "centerX", "CenterX"]),
+        center_z: int_field_any(root, &["zCenter", "centerZ", "CenterZ"]),
+        scale: int_field_any(root, &["scale", "Scale"]),
+        width: int_field_any(root, &["width", "Width"]),
+        height: int_field_any(root, &["height", "Height"]),
+        locked: bool_field_any(root, &["locked", "Locked"]),
+    }
+}
+
+fn map_pixels(roots: &[NbtTag]) -> Option<MapPixels> {
+    let root = roots.first().and_then(compound)?;
+    let colors = byte_array_field_any(root, &["colors", "Colors", "pixels", "Pixels"])?;
+    let width = int_field_any(root, &["width", "Width"])
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(128);
+    let height = int_field_any(root, &["height", "Height"])
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_else(|| {
+            u32::try_from(colors.len())
+                .ok()
+                .and_then(|len| len.checked_div(width))
+                .unwrap_or(128)
+        });
+    let expected_len = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
+    (colors.len() == expected_len).then_some(MapPixels {
+        width,
+        height,
+        colors: colors.iter().map(|value| *value as u8).collect(),
+    })
+}
+
+fn int_field_any(root: &IndexMap<String, NbtTag>, names: &[&str]) -> Option<i32> {
+    names.iter().find_map(|name| int_field(root, name))
+}
+
+fn bool_field_any(root: &IndexMap<String, NbtTag>, names: &[&str]) -> Option<bool> {
+    names.iter().find_map(|name| bool_field(root, name))
+}
+
+fn byte_array_field_any<'a>(
+    root: &'a IndexMap<String, NbtTag>,
+    names: &[&str],
+) -> Option<&'a [i8]> {
+    for name in names {
+        if let Some(NbtTag::ByteArray(values)) = root.get(*name) {
+            return Some(values);
+        }
+    }
+    None
 }
 
 pub(crate) fn parse_actor_value(value: &Bytes, report: &mut WorldParseReport) -> ParsedDbValue {
@@ -990,12 +1483,93 @@ fn read_height_map(value: &[u8]) -> Result<Vec<i16>, String> {
         .collect())
 }
 
+fn encode_biome_storage(storage: &ParsedBiomeStorage) -> WorldResult<Vec<u8>> {
+    if storage.palette.is_empty() {
+        return Err(BedrockWorldError::Validation(
+            "biome storage palette cannot be empty".to_string(),
+        ));
+    }
+    if storage.palette.len() == 1
+        && storage
+            .indices
+            .as_ref()
+            .is_none_or(|indices| indices.len() == 4096 && indices.iter().all(|index| *index == 0))
+    {
+        let mut bytes = Vec::with_capacity(5);
+        bytes.push(0);
+        let id = i32::try_from(storage.palette[0])
+            .map_err(|_| BedrockWorldError::Validation("biome id does not fit i32".to_string()))?;
+        bytes.extend_from_slice(&id.to_le_bytes());
+        return Ok(bytes);
+    }
+    let indices = storage.indices.as_ref().ok_or_else(|| {
+        BedrockWorldError::Validation("non-uniform biome storage requires indices".to_string())
+    })?;
+    if indices.len() != 4096 {
+        return Err(BedrockWorldError::Validation(format!(
+            "biome storage requires 4096 indices, got {}",
+            indices.len()
+        )));
+    }
+    let bits = bits_per_palette_index(storage.palette.len())?;
+    let mut bytes = Vec::new();
+    bytes.push(bits << 1);
+    bytes.extend_from_slice(&pack_indices(indices, bits)?);
+    let palette_len = i32::try_from(storage.palette.len()).map_err(|_| {
+        BedrockWorldError::Validation("biome palette length does not fit i32".to_string())
+    })?;
+    bytes.extend_from_slice(&palette_len.to_le_bytes());
+    for id in &storage.palette {
+        let id = i32::try_from(*id)
+            .map_err(|_| BedrockWorldError::Validation("biome id does not fit i32".to_string()))?;
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
 fn packed_word_count(bits_per_value: u8) -> usize {
     if bits_per_value == 0 {
         return 0;
     }
     let values_per_word = usize::from(32 / bits_per_value);
     4096_usize.div_ceil(values_per_word)
+}
+
+fn bits_per_palette_index(palette_len: usize) -> WorldResult<u8> {
+    let max_index = palette_len.saturating_sub(1);
+    for bits in [1_u8, 2, 3, 4, 5, 6, 8, 16] {
+        if max_index < (1_usize << bits) {
+            return Ok(bits);
+        }
+    }
+    Err(BedrockWorldError::Validation(format!(
+        "biome palette length {palette_len} exceeds encodable range"
+    )))
+}
+
+fn pack_indices(indices: &[u16], bits_per_value: u8) -> WorldResult<Vec<u8>> {
+    if !matches!(bits_per_value, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16) {
+        return Err(BedrockWorldError::Validation(format!(
+            "unsupported biome bits-per-value: {bits_per_value}"
+        )));
+    }
+    let values_per_word = usize::from(32 / bits_per_value);
+    let mask = (1_u32 << bits_per_value) - 1;
+    let mut bytes = Vec::with_capacity(packed_word_count(bits_per_value) * 4);
+    for chunk in indices.chunks(values_per_word) {
+        let mut word = 0_u32;
+        for (offset, value) in chunk.iter().enumerate() {
+            let value = u32::from(*value);
+            if value > mask {
+                return Err(BedrockWorldError::Validation(format!(
+                    "biome index {value} exceeds {bits_per_value}-bit palette"
+                )));
+            }
+            word |= value << (offset * usize::from(bits_per_value));
+        }
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    Ok(bytes)
 }
 
 fn unpack_indices(words_bytes: &[u8], bits_per_value: u8) -> Result<Vec<u16>, String> {
@@ -1247,9 +1821,13 @@ fn should_try_nbt_plain_key(name: &str) -> bool {
     matches!(
         name,
         "AutonomousEntities"
+            | "autonomousentities"
             | "BiomeData"
             | "LevelChunkMetaDataDictionary"
+            | "LocalPlayer"
+            | "Nether"
             | "Overworld"
+            | "TheEnd"
             | "WorldClocks"
             | "mobevents"
             | "scoreboard"
@@ -1485,6 +2063,73 @@ mod tests {
 
         assert_eq!(storage.biome_id_at(1, 2, 3), Some(30));
         assert_eq!(storage.biome_id_at(1, 3, 3), Some(10));
+    }
+
+    #[test]
+    fn hsa_records_roundtrip_reference_binary_layout() {
+        let areas = vec![ParsedHardcodedSpawnArea {
+            kind: HardcodedSpawnAreaKind::PillagerOutpost,
+            min: [1, 2, 3],
+            max: [4, 5, 6],
+        }];
+
+        let bytes = encode_hardcoded_spawn_area_records(&areas).expect("encode hsa");
+        let decoded = parse_hardcoded_spawn_area_records(&bytes).expect("decode hsa");
+
+        assert_eq!(bytes.len(), 29);
+        assert_eq!(decoded, areas);
+    }
+
+    #[test]
+    fn biome2d_and_biome3d_codecs_roundtrip() {
+        let height_map = (0..256).map(|value| value as i16).collect::<Vec<_>>();
+        let biomes = (0..256).map(|value| value as u8).collect::<Vec<_>>();
+        let data2d = Biome2d::new(height_map.clone(), biomes.clone()).expect("2d");
+        assert_eq!(
+            Biome2d::parse(&data2d.encode().expect("encode")).expect("parse"),
+            data2d
+        );
+
+        let storage = ParsedBiomeStorage {
+            y: Some(-64),
+            palette: vec![1, 2],
+            indices: Some(vec![0; 4096]),
+            counts: vec![4096, 0],
+        };
+        let data3d = Biome3d::new(height_map, vec![storage]).expect("3d");
+        assert_eq!(
+            Biome3d::parse(&data3d.encode().expect("encode")).expect("parse"),
+            data3d
+        );
+    }
+
+    #[test]
+    fn map_and_global_records_extract_typed_fields() {
+        let map_root = NbtTag::Compound(IndexMap::from([
+            ("dimension".to_string(), NbtTag::Int(0)),
+            ("xCenter".to_string(), NbtTag::Int(10)),
+            ("zCenter".to_string(), NbtTag::Int(-20)),
+            ("scale".to_string(), NbtTag::Byte(2)),
+            ("width".to_string(), NbtTag::Int(2)),
+            ("height".to_string(), NbtTag::Int(2)),
+            ("colors".to_string(), NbtTag::ByteArray(vec![1, 2, 3, 4])),
+        ]));
+        let map_bytes = Bytes::from(serialize_root_nbt(&map_root).expect("serialize"));
+        let map = parse_map_record(MapRecordId::unchecked("5"), map_bytes).expect("map");
+
+        assert_eq!(map.known_fields.center_x, Some(10));
+        assert_eq!(
+            map.pixels.as_ref().map(|pixels| pixels.colors.as_slice()),
+            Some(&[1, 2, 3, 4][..])
+        );
+
+        let global = parse_global_record(
+            GlobalRecordKind::Scoreboard,
+            "scoreboard".to_string(),
+            encode_consecutive_roots(&[NbtTag::Compound(IndexMap::new())]).expect("encode"),
+        )
+        .expect("global");
+        assert_eq!(global.kind, GlobalRecordKind::Scoreboard);
     }
 
     #[test]

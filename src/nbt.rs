@@ -134,6 +134,89 @@ impl<'a> NbtReader<'a> {
     pub fn parse_root_ref(&self) -> Result<NbtRef<'a>> {
         self.parse_root().map(NbtRef::from_owned)
     }
+
+    pub fn view(&self) -> NbtView<'a> {
+        NbtView::new(self.data)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Borrowed Bedrock NBT payload view.
+pub struct NbtView<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NbtView<'a> {
+    #[must_use]
+    pub const fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    pub fn events(&self) -> Result<Vec<NbtEvent<'a>>> {
+        parse_nbt_events(self.data)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Borrowed NBT parse event.
+pub enum NbtEvent<'a> {
+    BeginCompound {
+        name: Option<&'a str>,
+    },
+    EndCompound,
+    BeginList {
+        name: Option<&'a str>,
+        element_type: u8,
+        len: usize,
+    },
+    EndList,
+    Byte {
+        name: Option<&'a str>,
+        value: i8,
+    },
+    Short {
+        name: Option<&'a str>,
+        value: i16,
+    },
+    Int {
+        name: Option<&'a str>,
+        value: i32,
+    },
+    Long {
+        name: Option<&'a str>,
+        value: i64,
+    },
+    Float {
+        name: Option<&'a str>,
+        value: f32,
+    },
+    Double {
+        name: Option<&'a str>,
+        value: f64,
+    },
+    String {
+        name: Option<&'a str>,
+        value: &'a str,
+    },
+    ByteArray {
+        name: Option<&'a str>,
+        bytes: &'a [u8],
+    },
+    IntArray {
+        name: Option<&'a str>,
+        bytes: &'a [u8],
+        len: usize,
+    },
+    LongArray {
+        name: Option<&'a str>,
+        bytes: &'a [u8],
+        len: usize,
+    },
+    ShortArray {
+        name: Option<&'a str>,
+        bytes: &'a [u8],
+        len: usize,
+    },
 }
 
 impl NbtRef<'_> {
@@ -612,6 +695,230 @@ fn write_i32_len(writer: &mut impl Write, len: usize) -> Result<()> {
     write_i32(writer, len as i32)
 }
 
+fn parse_nbt_events(data: &[u8]) -> Result<Vec<NbtEvent<'_>>> {
+    let mut reader = SliceNbtReader::new(data);
+    let tag_type = reader.read_u8()?;
+    if tag_type != TAG_COMPOUND {
+        return Err(BedrockWorldError::Nbt(
+            "root NBT tag must be Compound".to_string(),
+        ));
+    }
+    let name = reader.read_string_ref()?;
+    let mut events = Vec::new();
+    parse_event_payload(&mut reader, tag_type, Some(name), 0, &mut events)?;
+    Ok(events)
+}
+
+fn parse_event_payload<'a>(
+    reader: &mut SliceNbtReader<'a>,
+    tag_type: u8,
+    name: Option<&'a str>,
+    depth: usize,
+    events: &mut Vec<NbtEvent<'a>>,
+) -> Result<()> {
+    ensure_depth(depth, tag_type)?;
+    match tag_type {
+        TAG_BYTE => events.push(NbtEvent::Byte {
+            name,
+            value: reader.read_i8()?,
+        }),
+        TAG_SHORT => events.push(NbtEvent::Short {
+            name,
+            value: reader.read_i16()?,
+        }),
+        TAG_INT => events.push(NbtEvent::Int {
+            name,
+            value: reader.read_i32()?,
+        }),
+        TAG_LONG => events.push(NbtEvent::Long {
+            name,
+            value: reader.read_i64()?,
+        }),
+        TAG_FLOAT => events.push(NbtEvent::Float {
+            name,
+            value: reader.read_f32()?,
+        }),
+        TAG_DOUBLE => events.push(NbtEvent::Double {
+            name,
+            value: reader.read_f64()?,
+        }),
+        TAG_BYTE_ARRAY => {
+            let len = reader.read_byte_length("ByteArray")?;
+            events.push(NbtEvent::ByteArray {
+                name,
+                bytes: reader.take(len)?,
+            });
+        }
+        TAG_STRING => events.push(NbtEvent::String {
+            name,
+            value: reader.read_string_ref()?,
+        }),
+        TAG_LIST => {
+            let element_type = reader.read_u8()?;
+            let len = reader.read_container_length("List")?;
+            events.push(NbtEvent::BeginList {
+                name,
+                element_type,
+                len,
+            });
+            for _ in 0..len {
+                parse_event_payload(reader, element_type, None, depth + 1, events)?;
+            }
+            events.push(NbtEvent::EndList);
+        }
+        TAG_COMPOUND => {
+            events.push(NbtEvent::BeginCompound { name });
+            loop {
+                let child_type = reader.read_u8()?;
+                if child_type == TAG_END {
+                    break;
+                }
+                let child_name = reader.read_string_ref()?;
+                parse_event_payload(reader, child_type, Some(child_name), depth + 1, events)?;
+            }
+            events.push(NbtEvent::EndCompound);
+        }
+        TAG_INT_ARRAY => {
+            let len = reader.read_container_length("IntArray")?;
+            events.push(NbtEvent::IntArray {
+                name,
+                bytes: reader.take_array_bytes(len, 4, "IntArray")?,
+                len,
+            });
+        }
+        TAG_LONG_ARRAY => {
+            let len = reader.read_container_length("LongArray")?;
+            events.push(NbtEvent::LongArray {
+                name,
+                bytes: reader.take_array_bytes(len, 8, "LongArray")?,
+                len,
+            });
+        }
+        TAG_SHORT_ARRAY => {
+            let len = reader.read_container_length("ShortArray")?;
+            events.push(NbtEvent::ShortArray {
+                name,
+                bytes: reader.take_array_bytes(len, 2, "ShortArray")?,
+                len,
+            });
+        }
+        TAG_END => {}
+        _ => {
+            return Err(BedrockWorldError::Nbt(format!(
+                "unknown NBT tag type: {tag_type}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct SliceNbtReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SliceNbtReader<'a> {
+    const fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| BedrockWorldError::Nbt("NBT slice range overflowed".to_string()))?;
+        let bytes = self
+            .data
+            .get(self.offset..end)
+            .ok_or_else(|| BedrockWorldError::Nbt("NBT payload is truncated".to_string()))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        Ok(*self
+            .take(1)?
+            .first()
+            .ok_or_else(|| BedrockWorldError::Nbt("NBT byte is truncated".to_string()))?)
+    }
+
+    fn read_i8(&mut self) -> Result<i8> {
+        Ok(self.read_u8()? as i8)
+    }
+
+    fn read_i16(&mut self) -> Result<i16> {
+        let bytes: [u8; 2] = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| BedrockWorldError::Nbt("NBT i16 is truncated".to_string()))?;
+        Ok(i16::from_le_bytes(bytes))
+    }
+
+    fn read_i32(&mut self) -> Result<i32> {
+        let bytes: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| BedrockWorldError::Nbt("NBT i32 is truncated".to_string()))?;
+        Ok(i32::from_le_bytes(bytes))
+    }
+
+    fn read_i64(&mut self) -> Result<i64> {
+        let bytes: [u8; 8] = self
+            .take(8)?
+            .try_into()
+            .map_err(|_| BedrockWorldError::Nbt("NBT i64 is truncated".to_string()))?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+
+    fn read_f32(&mut self) -> Result<f32> {
+        Ok(f32::from_bits(self.read_i32()? as u32))
+    }
+
+    fn read_f64(&mut self) -> Result<f64> {
+        Ok(f64::from_bits(self.read_i64()? as u64))
+    }
+
+    fn read_string_ref(&mut self) -> Result<&'a str> {
+        let len_bytes: [u8; 2] = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| BedrockWorldError::Nbt("NBT string length is truncated".to_string()))?;
+        let len = u16::from_le_bytes(len_bytes) as usize;
+        let bytes = self.take(len)?;
+        Ok(std::str::from_utf8(bytes)?)
+    }
+
+    fn read_container_length(&mut self, name: &str) -> Result<usize> {
+        let len = self.read_i32()?;
+        if len < 0 {
+            return Err(BedrockWorldError::Nbt(format!(
+                "{name} has negative length"
+            )));
+        }
+        let len = usize::try_from(len)
+            .map_err(|_| BedrockWorldError::Nbt(format!("{name} length overflow")))?;
+        if len > MAX_NBT_CONTAINER_LENGTH {
+            return Err(BedrockWorldError::Nbt(format!("{name} is too large")));
+        }
+        Ok(len)
+    }
+
+    fn read_byte_length(&mut self, name: &str) -> Result<usize> {
+        let len = self.read_container_length(name)?;
+        if len > MAX_NBT_BYTE_LENGTH {
+            return Err(BedrockWorldError::Nbt(format!("{name} is too large")));
+        }
+        Ok(len)
+    }
+
+    fn take_array_bytes(&mut self, len: usize, width: usize, name: &str) -> Result<&'a [u8]> {
+        let byte_len = len
+            .checked_mul(width)
+            .ok_or_else(|| BedrockWorldError::Nbt(format!("{name} byte length overflow")))?;
+        self.take(byte_len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +962,43 @@ mod tests {
         let (_, consumed) = parse_root_nbt_with_consumed(&combined).expect("parse");
 
         assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn nbt_view_emits_borrowed_events_without_owned_dom() {
+        let mut root = IndexMap::new();
+        root.insert("Name".to_string(), NbtTag::String("Borrowed".to_string()));
+        root.insert("Seed".to_string(), NbtTag::Long(42));
+        root.insert("Bytes".to_string(), NbtTag::ByteArray(vec![1, 2, 3]));
+        let bytes = serialize_root_nbt(&NbtTag::Compound(root)).expect("serialize");
+
+        let events = NbtReader::new(&bytes).view().events().expect("events");
+
+        assert!(matches!(
+            events.first(),
+            Some(NbtEvent::BeginCompound { name: Some("") })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NbtEvent::String {
+                name: Some("Name"),
+                value: "Borrowed"
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NbtEvent::Long {
+                name: Some("Seed"),
+                value: 42
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NbtEvent::ByteArray {
+                name: Some("Bytes"),
+                bytes
+            } if *bytes == [1, 2, 3]
+        )));
     }
 
     #[test]

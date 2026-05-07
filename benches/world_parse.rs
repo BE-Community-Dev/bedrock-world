@@ -1,5 +1,6 @@
 use bedrock_world::{
-    BedrockLevelDbStorage, BedrockWorld, ChunkPos, Dimension, NbtTag, NbtWriter, OpenOptions,
+    BedrockLevelDbStorage, BedrockWorld, ChunkPos, Dimension, NbtReader, NbtTag, NbtWriter,
+    OpenOptions,
     chunk::{SubChunkDecodeMode, parse_subchunk, parse_subchunk_with_mode},
     parse_level_dat_document, read_level_dat_document,
 };
@@ -29,6 +30,17 @@ fn bench_level_dat(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(synthetic.len() as u64));
     group.bench_function("parse_synthetic", |b| {
         b.iter(|| parse_level_dat_document(black_box(&synthetic)).expect("parse level.dat"));
+    });
+    group.bench_function("nbt_events_synthetic", |b| {
+        let nbt_payload = &synthetic[8..];
+        b.iter(|| {
+            black_box(
+                NbtReader::new(black_box(nbt_payload))
+                    .view()
+                    .events()
+                    .expect("borrowed events"),
+            );
+        });
     });
     if level_dat_path.exists() {
         group.bench_function("read_fixture", |b| {

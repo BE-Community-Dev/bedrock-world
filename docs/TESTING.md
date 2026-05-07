@@ -26,12 +26,30 @@ missing, those checks print a skip message and return successfully.
 
 Do not commit this folder. Real worlds are large and may contain player data.
 
+Legacy compatibility must use synthetic fixtures in CI. Cover both a memory
+storage world containing only `LegacyTerrain` and a small generated
+`chunks.dat` location table. Manual validation with a real 0.16 world is useful,
+but the world itself must stay outside the repository.
+
+Render exact-batch tests should include shuffled, duplicated, and
+priority-sorted `ChunkPos` inputs. Use asymmetric block/height/biome sentinel
+values and assert that every returned `RenderChunkData.pos` still owns the
+matching decoded records with `RenderLoadStats::prefix_scans == 0`.
+
+Surface correctness tests should prefer `RenderChunkRequest::ExactSurface`.
+Create fixtures where raw Data2D/Data3D or legacy heightmap values disagree
+with actual subchunk blocks, then assert `column_samples` reports the real top
+block, overlay/water context when present, and
+`RenderLoadStats::raw_height_mismatch_columns` is non-zero. Raw heightmap
+behavior belongs in `RenderChunkRequest::RawHeightMap` tests.
+
 ## Benchmarks
 
-Run all benches with:
+Run the v0.2 benchmark set with:
 
 ```powershell
-cargo bench
+cargo bench --all-features --bench world_parse -- --noplot
+cargo bench --all-features --bench large_fixture
 ```
 
 `benches/world_parse.rs` always runs a synthetic `level.dat` parse benchmark and
@@ -40,3 +58,11 @@ adds LevelDB/chunk/subchunk benchmarks when the optional large fixture exists.
 `benches/large_fixture.rs` is a one-shot harness for multi-million-entry scans.
 It prints elapsed time and throughput once instead of asking Criterion to repeat
 the scan many times.
+
+The local fixture used for the current baseline is:
+
+```text
+C:\Users\Administrator\Desktop\BE-Community-Dev\bedrock-world\tests\fixtures\sample-bedrock-world
+```
+
+Latest local numbers are recorded in [`BENCHMARKS.md`](BENCHMARKS.md).

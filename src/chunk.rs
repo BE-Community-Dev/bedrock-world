@@ -271,23 +271,56 @@ impl ChunkRecordTag {
             other => Self::Unknown(other),
         }
     }
+
+    #[must_use]
+    pub const fn is_render_chunk_record(self) -> bool {
+        matches!(
+            self,
+            Self::Data3D
+                | Self::Data2D
+                | Self::Data2DLegacy
+                | Self::LegacyTerrain
+                | Self::SubChunkPrefix
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Classified Bedrock `LevelDB` key.
+///
+/// Chunk keys carry coordinate/tag structure. Non-chunk variants model the
+/// documented global, player, map, village, actor, and string-key records while
+/// preserving unknown bytes for forward compatibility.
 pub enum BedrockDbKey {
+    /// Chunk-scoped record such as subchunk terrain, block entities, or HSA.
     Chunk(ChunkKey),
+    /// Local-player key, accepting both `LocalPlayer` and `~local_player`.
     LocalPlayer,
+    /// Remote-player key using the `player_` prefix.
     RemotePlayer(String),
+    /// Modern actor payload key `actorprefix<uid>`.
     ActorPrefix { actor_id: i64 },
+    /// Modern actor digest key `digp<x><z>[dimension]`.
     ActorDigest { pos: ChunkPos },
+    /// Map data key with the `map_` prefix.
     Map(String),
+    /// Village record key.
     Village(ParsedVillageKey),
+    /// Known global record key.
+    Global(GlobalRecordKind),
+    /// Nether/end portal tracking record.
     Portals,
+    /// Scheduler write tracking record.
     SchedulerWt,
+    /// Structure-template record.
     StructureTemplate(String),
+    /// Ticking-area record.
     TickingArea(String),
+    /// Flat-world layer settings record.
     GameFlatWorldLayers,
+    /// Other UTF-8 key not matched by a more specific classifier.
     PlainString(String),
+    /// Non-UTF-8 or otherwise unknown key bytes.
     Unknown(Bytes),
 }
 
@@ -306,6 +339,194 @@ pub struct ParsedVillageKey {
     pub dimension: Option<Dimension>,
     pub uuid: String,
     pub kind: VillageRecordKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Validated map record identifier without the `map_` storage prefix.
+pub struct MapRecordId(String);
+
+impl MapRecordId {
+    /// Creates a map record id from a printable ASCII suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BedrockWorldError::Validation`] when the id is empty or
+    /// contains non-printable/non-ASCII bytes.
+    pub fn new(id: impl Into<String>) -> Result<Self> {
+        let id = id.into();
+        if id.is_empty() || !id.as_bytes().iter().all(u8::is_ascii_graphic) {
+            return Err(BedrockWorldError::Validation(
+                "map id must be non-empty printable ASCII".to_string(),
+            ));
+        }
+        Ok(Self(id))
+    }
+
+    #[must_use]
+    /// Creates a map record id without validation.
+    ///
+    /// Use this only when preserving an already-decoded storage key.
+    pub fn unchecked(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    #[must_use]
+    /// Returns the id suffix without the `map_` storage prefix.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    /// Encodes this id as the `LevelDB` key `map_<id>`.
+    pub fn storage_key(&self) -> Bytes {
+        Bytes::from(format!("map_{}", self.0))
+    }
+
+    #[must_use]
+    /// Decodes a `LevelDB` map key into an id suffix.
+    pub fn from_storage_key(key: &[u8]) -> Option<Self> {
+        ascii_suffix(key, b"map_").map(Self)
+    }
+}
+
+impl std::fmt::Display for MapRecordId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for MapRecordId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Actor unique id used by modern `actorprefix` records.
+pub struct ActorUid(pub i64);
+
+impl ActorUid {
+    #[must_use]
+    /// Encodes this actor id as `actorprefix<little-endian i64>`.
+    pub fn storage_key(self) -> Bytes {
+        let mut bytes = Vec::with_capacity(19);
+        bytes.extend_from_slice(b"actorprefix");
+        bytes.extend_from_slice(&self.0.to_le_bytes());
+        Bytes::from(bytes)
+    }
+
+    #[must_use]
+    /// Decodes an `actorprefix` storage key into an actor id.
+    pub fn from_actorprefix_key(key: &[u8]) -> Option<Self> {
+        parse_i64_suffix(key, b"actorprefix").map(Self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Chunk actor digest key used by modern Bedrock entity storage.
+pub struct ActorDigestKey {
+    /// Chunk whose digest lists actor ids for the chunk.
+    pub pos: ChunkPos,
+}
+
+impl ActorDigestKey {
+    #[must_use]
+    /// Creates a digest key for a chunk.
+    pub const fn new(pos: ChunkPos) -> Self {
+        Self { pos }
+    }
+
+    #[must_use]
+    /// Encodes this digest as `digp<x><z>[dimension]`.
+    pub fn storage_key(self) -> Bytes {
+        let mut bytes = Vec::with_capacity(if self.pos.dimension == Dimension::Overworld {
+            12
+        } else {
+            16
+        });
+        bytes.extend_from_slice(b"digp");
+        bytes.extend_from_slice(&self.pos.x.to_le_bytes());
+        bytes.extend_from_slice(&self.pos.z.to_le_bytes());
+        if self.pos.dimension != Dimension::Overworld {
+            bytes.extend_from_slice(&self.pos.dimension.id().to_le_bytes());
+        }
+        Bytes::from(bytes)
+    }
+
+    #[must_use]
+    /// Decodes a `digp` storage key into a digest key.
+    pub fn from_storage_key(key: &[u8]) -> Option<Self> {
+        parse_chunk_pos_suffix(key, b"digp").map(Self::new)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Known non-chunk global records in a Bedrock `LevelDB` world.
+pub enum GlobalRecordKind {
+    /// `mobevents` global NBT record.
+    MobEvents,
+    /// Dimension metadata record: `Overworld`, `Nether`, or `TheEnd`.
+    Dimension(Dimension),
+    /// `scoreboard` global NBT record.
+    Scoreboard,
+    /// `LocalPlayer` global/player record.
+    LocalPlayer,
+    /// Autonomous entity tracking record.
+    AutonomousEntities,
+    /// Global biome metadata dictionary.
+    BiomeData,
+    /// Level chunk metadata dictionary.
+    LevelChunkMetaDataDictionary,
+    /// World clock metadata.
+    WorldClocks,
+    /// Preserved UTF-8 global key not recognized by this crate.
+    Other(String),
+}
+
+impl GlobalRecordKind {
+    #[must_use]
+    /// Classifies an exact storage key as a known global record.
+    pub fn from_key(key: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(key).ok()?;
+        match text {
+            "mobevents" => Some(Self::MobEvents),
+            "Overworld" => Some(Self::Dimension(Dimension::Overworld)),
+            "Nether" => Some(Self::Dimension(Dimension::Nether)),
+            "TheEnd" => Some(Self::Dimension(Dimension::End)),
+            "scoreboard" => Some(Self::Scoreboard),
+            "LocalPlayer" => Some(Self::LocalPlayer),
+            "AutonomousEntities" | "autonomousentities" => Some(Self::AutonomousEntities),
+            "BiomeData" => Some(Self::BiomeData),
+            "LevelChunkMetaDataDictionary" => Some(Self::LevelChunkMetaDataDictionary),
+            "WorldClocks" => Some(Self::WorldClocks),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    /// Returns the canonical storage name for this global record.
+    pub fn name(&self) -> String {
+        match self {
+            Self::MobEvents => "mobevents".to_string(),
+            Self::Dimension(Dimension::Overworld) => "Overworld".to_string(),
+            Self::Dimension(Dimension::Nether) => "Nether".to_string(),
+            Self::Dimension(Dimension::End) => "TheEnd".to_string(),
+            Self::Dimension(Dimension::Unknown(id)) => format!("Dimension({id})"),
+            Self::Scoreboard => "scoreboard".to_string(),
+            Self::LocalPlayer => "LocalPlayer".to_string(),
+            Self::AutonomousEntities => "AutonomousEntities".to_string(),
+            Self::BiomeData => "BiomeData".to_string(),
+            Self::LevelChunkMetaDataDictionary => "LevelChunkMetaDataDictionary".to_string(),
+            Self::WorldClocks => "WorldClocks".to_string(),
+            Self::Other(name) => name.clone(),
+        }
+    }
+
+    #[must_use]
+    /// Encodes this global kind as an exact `LevelDB` key.
+    pub fn storage_key(&self) -> Bytes {
+        Bytes::from(self.name())
+    }
 }
 
 impl BedrockDbKey {
@@ -344,6 +565,9 @@ impl BedrockDbKey {
         if key == b"game_flatworldlayers" {
             return Self::GameFlatWorldLayers;
         }
+        if let Some(kind) = GlobalRecordKind::from_key(key) {
+            return Self::Global(kind);
+        }
         if key.iter().all(u8::is_ascii_graphic) {
             return Self::PlainString(String::from_utf8_lossy(key).into_owned());
         }
@@ -366,6 +590,7 @@ impl BedrockDbKey {
             Self::ActorDigest { .. } => "ActorDigest".to_string(),
             Self::Map(_) => "Map".to_string(),
             Self::Village(village) => format!("Village::{:?}", village.kind),
+            Self::Global(kind) => format!("Global::{}", kind.name()),
             Self::Portals => "Portals".to_string(),
             Self::SchedulerWt => "SchedulerWt".to_string(),
             Self::StructureTemplate(_) => "StructureTemplate".to_string(),
@@ -373,6 +598,27 @@ impl BedrockDbKey {
             Self::GameFlatWorldLayers => "GameFlatWorldLayers".to_string(),
             Self::PlainString(value) => format!("PlainString::{value}"),
             Self::Unknown(_) => "Unknown".to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Option<Bytes> {
+        match self {
+            Self::Chunk(key) => Some(key.encode()),
+            Self::LocalPlayer => Some(Bytes::from_static(b"~local_player")),
+            Self::RemotePlayer(xuid) => Some(Bytes::from(format!("player_{xuid}"))),
+            Self::ActorPrefix { actor_id } => Some(ActorUid(*actor_id).storage_key()),
+            Self::ActorDigest { pos } => Some(ActorDigestKey::new(*pos).storage_key()),
+            Self::Map(id) => Some(MapRecordId::unchecked(id.clone()).storage_key()),
+            Self::Village(key) => Some(Bytes::copy_from_slice(key.raw.as_bytes())),
+            Self::Global(kind) => Some(kind.storage_key()),
+            Self::Portals => Some(Bytes::from_static(b"portals")),
+            Self::SchedulerWt => Some(Bytes::from_static(b"schedulerWT")),
+            Self::StructureTemplate(name) => Some(Bytes::from(format!("structuretemplate{name}"))),
+            Self::TickingArea(name) => Some(Bytes::from(format!("tickingarea{name}"))),
+            Self::GameFlatWorldLayers => Some(Bytes::from_static(b"game_flatworldlayers")),
+            Self::PlainString(name) => Some(Bytes::copy_from_slice(name.as_bytes())),
+            Self::Unknown(bytes) => Some(bytes.clone()),
         }
     }
 }
@@ -535,6 +781,36 @@ impl SubChunk {
     }
 
     #[must_use]
+    pub fn visible_block_state_at(
+        &self,
+        local_x: u8,
+        local_y: u8,
+        local_z: u8,
+    ) -> Option<&BlockState> {
+        self.visible_block_states_at(local_x, local_y, local_z)
+            .next()
+    }
+
+    #[must_use]
+    pub fn visible_block_states_at(
+        &self,
+        local_x: u8,
+        local_y: u8,
+        local_z: u8,
+    ) -> VisibleBlockStatesAt<'_> {
+        let storages = match &self.format {
+            SubChunkFormat::Paletted { storages, .. } => Some(storages.iter().rev()),
+            _ => None,
+        };
+        VisibleBlockStatesAt {
+            storages,
+            local_x,
+            local_y,
+            local_z,
+        }
+    }
+
+    #[must_use]
     pub fn legacy_block_id_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         match &self.format {
             SubChunkFormat::LegacySubChunk(subchunk) => {
@@ -552,6 +828,61 @@ impl SubChunk {
             }
             _ => None,
         }
+    }
+}
+
+pub struct VisibleBlockStatesAt<'chunk> {
+    storages: Option<std::iter::Rev<std::slice::Iter<'chunk, BlockPalette>>>,
+    local_x: u8,
+    local_y: u8,
+    local_z: u8,
+}
+
+impl<'chunk> Iterator for VisibleBlockStatesAt<'chunk> {
+    type Item = &'chunk BlockState;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let storages = self.storages.as_mut()?;
+        for storage in storages {
+            let Some(state) = storage.block_state_at(self.local_x, self.local_y, self.local_z)
+            else {
+                continue;
+            };
+            if !is_air_block_state_name(&state.name) {
+                return Some(state);
+            }
+        }
+        None
+    }
+}
+
+fn is_air_block_state_name(name: &str) -> bool {
+    matches!(
+        name,
+        "air"
+            | "cave_air"
+            | "void_air"
+            | "minecraft:air"
+            | "minecraft:cave_air"
+            | "minecraft:void_air"
+            | "minecraft:structure_void"
+            | "minecraft:light_block"
+            | "minecraft:light"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyBiomeSample {
+    pub biome_id: u8,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl LegacyBiomeSample {
+    #[must_use]
+    pub const fn rgb_u32(self) -> u32 {
+        ((self.red as u32) << 16) | ((self.green as u32) << 8) | self.blue as u32
     }
 }
 
@@ -609,7 +940,7 @@ impl LegacyTerrain {
     #[must_use]
     pub fn block_index(local_x: u8, local_y: u8, local_z: u8) -> Option<usize> {
         if local_x < 16 && local_y < 128 && local_z < 16 {
-            Some((usize::from(local_y) * 16 + usize::from(local_z)) * 16 + usize::from(local_x))
+            Some((usize::from(local_x) << 11) | (usize::from(local_z) << 7) | usize::from(local_y))
         } else {
             None
         }
@@ -654,10 +985,21 @@ impl LegacyTerrain {
     }
 
     #[must_use]
-    pub fn biome_color_at(&self, local_x: u8, local_z: u8) -> Option<u32> {
+    pub fn biome_sample_at(&self, local_x: u8, local_z: u8) -> Option<LegacyBiomeSample> {
         let offset = Self::column_index(local_x, local_z)?.checked_mul(4)?;
-        let bytes: [u8; 4] = self.biomes().get(offset..offset + 4)?.try_into().ok()?;
-        Some(u32::from_le_bytes(bytes))
+        let bytes = self.biomes().get(offset..offset + 4)?;
+        Some(LegacyBiomeSample {
+            biome_id: bytes[0],
+            red: bytes[1],
+            green: bytes[2],
+            blue: bytes[3],
+        })
+    }
+
+    #[must_use]
+    pub fn biome_color_at(&self, local_x: u8, local_z: u8) -> Option<u32> {
+        self.biome_sample_at(local_x, local_z)
+            .map(LegacyBiomeSample::rgb_u32)
     }
 }
 
@@ -737,7 +1079,7 @@ impl LegacySubChunk {
     #[must_use]
     pub fn block_index(local_x: u8, local_y: u8, local_z: u8) -> Option<usize> {
         if local_x < 16 && local_y < 16 && local_z < 16 {
-            Some((usize::from(local_y) * 16 + usize::from(local_z)) * 16 + usize::from(local_x))
+            Some(usize::from(local_x) * 256 + usize::from(local_z) * 16 + usize::from(local_y))
         } else {
             None
         }
@@ -816,20 +1158,37 @@ impl Chunk {
         let local_y = u8::try_from(i32::from(y).rem_euclid(16)).map_err(|_| {
             BedrockWorldError::Validation(format!("block y={y} has invalid local subchunk offset"))
         })?;
-        let Some(subchunk) = self.get_subchunk(subchunk_y)? else {
-            return Err(BedrockWorldError::UnsupportedChunkFormat(format!(
-                "chunk {:?} has no subchunk at y={subchunk_y}",
-                self.pos
-            )));
-        };
-        if let Some(state) = subchunk.block_state_at(x, local_y, z) {
-            return Ok(state.clone());
-        }
-        if let Some(id) = subchunk.legacy_block_id_at(x, local_y, z) {
-            let mut states = BTreeMap::new();
-            if let Some(data) = subchunk.legacy_block_data_at(x, local_y, z) {
-                states.insert("data".to_string(), NbtTag::Byte(data as i8));
+        if let Some(subchunk) = self.get_subchunk(subchunk_y)? {
+            if let Some(state) = subchunk.block_state_at(x, local_y, z) {
+                return Ok(state.clone());
             }
+            if let Some(id) = subchunk.legacy_block_id_at(x, local_y, z) {
+                let mut states = BTreeMap::new();
+                if let Some(data) = subchunk.legacy_block_data_at(x, local_y, z) {
+                    states.insert("data".to_string(), NbtTag::Byte(data as i8));
+                }
+                return Ok(BlockState {
+                    name: format!("legacy:{id}"),
+                    states,
+                    version: None,
+                });
+            }
+        }
+        if (0..=127).contains(&y)
+            && let Some(terrain) = self.legacy_terrain()?
+        {
+            let local_y = u8::try_from(y).map_err(|_| {
+                BedrockWorldError::Validation(format!("legacy block y={y} is outside 0..127"))
+            })?;
+            let id = terrain.block_id_at(x, local_y, z).ok_or_else(|| {
+                BedrockWorldError::UnsupportedChunkFormat(format!(
+                    "chunk {:?} has no legacy block id at local ({x}, {y}, {z})",
+                    self.pos
+                ))
+            })?;
+            let data = terrain.block_data_at(x, local_y, z).unwrap_or(0);
+            let mut states = BTreeMap::new();
+            states.insert("data".to_string(), NbtTag::Byte(data as i8));
             return Ok(BlockState {
                 name: format!("legacy:{id}"),
                 states,
@@ -884,7 +1243,7 @@ pub fn parse_subchunk_with_mode(y: i8, bytes: Bytes, mode: SubChunkDecodeMode) -
             |_| SubChunkFormat::Raw { version, bytes },
             SubChunkFormat::LegacySubChunk,
         ),
-        Some(version @ 1) => parse_palette_storages(&bytes, 1, 1, mode).map_or_else(
+        Some(version @ 1) => parse_exact_palette_storages(&bytes, 1, 1, mode).map_or_else(
             |_| SubChunkFormat::Raw {
                 version: Some(version),
                 bytes,
@@ -918,7 +1277,7 @@ fn parse_paletted_subchunk(
     };
     let offsets: &[usize] = if version == 9 { &[3, 2] } else { &[2] };
     for offset in offsets {
-        if let Ok(storages) = parse_palette_storages(bytes, *offset, storage_count, mode) {
+        if let Ok(storages) = parse_exact_palette_storages(bytes, *offset, storage_count, mode) {
             return Ok(SubChunkFormat::Paletted { version, storages });
         }
     }
@@ -927,12 +1286,28 @@ fn parse_paletted_subchunk(
     ))
 }
 
+fn parse_exact_palette_storages(
+    bytes: &[u8],
+    offset: usize,
+    storage_count: u8,
+    mode: SubChunkDecodeMode,
+) -> Result<Vec<BlockPalette>> {
+    let (storages, consumed) = parse_palette_storages(bytes, offset, storage_count, mode)?;
+    if consumed != bytes.len() {
+        return Err(BedrockWorldError::UnsupportedChunkFormat(format!(
+            "palette storage ended at byte {consumed} but payload has {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(storages)
+}
+
 fn parse_palette_storages(
     bytes: &[u8],
     mut offset: usize,
     storage_count: u8,
     mode: SubChunkDecodeMode,
-) -> Result<Vec<BlockPalette>> {
+) -> Result<(Vec<BlockPalette>, usize)> {
     let mut storages = Vec::with_capacity(usize::from(storage_count));
     for _ in 0..storage_count {
         let header = *bytes.get(offset).ok_or_else(|| {
@@ -960,21 +1335,26 @@ fn parse_palette_storages(
         })?;
         offset += words_byte_len;
 
-        let palette_len = read_i32_at(bytes, offset)?;
-        offset += 4;
-        if palette_len < 0 {
-            return Err(BedrockWorldError::UnsupportedChunkFormat(
-                "palette length cannot be negative".to_string(),
-            ));
-        }
-        let palette_len = usize::try_from(palette_len).map_err(|_| {
-            BedrockWorldError::UnsupportedChunkFormat("palette length overflowed".to_string())
-        })?;
-        if palette_len > MAX_SUBCHUNK_PALETTE_LEN {
-            return Err(BedrockWorldError::UnsupportedChunkFormat(format!(
-                "palette length {palette_len} exceeds maximum {MAX_SUBCHUNK_PALETTE_LEN}"
-            )));
-        }
+        let palette_len = if bits_per_block == 0 {
+            1
+        } else {
+            let palette_len = read_i32_at(bytes, offset)?;
+            offset += 4;
+            if palette_len < 0 {
+                return Err(BedrockWorldError::UnsupportedChunkFormat(
+                    "palette length cannot be negative".to_string(),
+                ));
+            }
+            let palette_len = usize::try_from(palette_len).map_err(|_| {
+                BedrockWorldError::UnsupportedChunkFormat("palette length overflowed".to_string())
+            })?;
+            if palette_len > MAX_SUBCHUNK_PALETTE_LEN {
+                return Err(BedrockWorldError::UnsupportedChunkFormat(format!(
+                    "palette length {palette_len} exceeds maximum {MAX_SUBCHUNK_PALETTE_LEN}"
+                )));
+            }
+            palette_len
+        };
         let mut states = Vec::with_capacity(palette_len);
         for _ in 0..palette_len {
             let (tag, consumed) = parse_root_nbt_with_consumed(&bytes[offset..])?;
@@ -999,7 +1379,7 @@ fn parse_palette_storages(
             counts,
         });
     }
-    Ok(storages)
+    Ok((storages, offset))
 }
 
 fn packed_word_count(bits_per_block: u8) -> usize {
@@ -1251,6 +1631,41 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_db_key_encodes_documented_global_shapes() {
+        let map_id = MapRecordId::new("42").expect("map id");
+        assert_eq!(map_id.storage_key().as_ref(), b"map_42");
+        assert_eq!(
+            MapRecordId::from_storage_key(b"map_42"),
+            Some(map_id.clone())
+        );
+        assert_eq!(
+            BedrockDbKey::Map("42".to_string()).encode().as_deref(),
+            Some(&b"map_42"[..])
+        );
+
+        let pos = ChunkPos {
+            x: 7,
+            z: -8,
+            dimension: Dimension::End,
+        };
+        let digest = ActorDigestKey::new(pos).storage_key();
+        assert_eq!(
+            ActorDigestKey::from_storage_key(&digest),
+            Some(ActorDigestKey::new(pos))
+        );
+        assert_eq!(
+            BedrockDbKey::Global(GlobalRecordKind::Scoreboard)
+                .encode()
+                .as_deref(),
+            Some(&b"scoreboard"[..])
+        );
+        assert_eq!(
+            BedrockDbKey::decode(b"TheEnd"),
+            BedrockDbKey::Global(GlobalRecordKind::Dimension(Dimension::End))
+        );
+    }
+
+    #[test]
     fn chunk_record_tags_align_with_bedrock_level_reference() {
         let expected = [
             (0x2b, ChunkRecordTag::Data3D),
@@ -1296,7 +1711,7 @@ mod tests {
         ));
         assert!(matches!(
             BedrockDbKey::decode(b"LevelChunkMetaDataDictionary"),
-            BedrockDbKey::PlainString(_)
+            BedrockDbKey::Global(GlobalRecordKind::LevelChunkMetaDataDictionary)
         ));
     }
 
@@ -1329,7 +1744,9 @@ mod tests {
     fn legacy_terrain_exposes_old_leveldb_arrays() {
         let mut bytes = vec![0; LEGACY_TERRAIN_VALUE_LEN];
         let block_index = LegacyTerrain::block_index(1, 2, 3).expect("block index");
-        let column_index = LegacyTerrain::column_index(1, 3).expect("column index");
+        let column_index = 3 * 16 + 1;
+        assert_eq!(block_index, 2_434);
+        assert_eq!(LegacyTerrain::column_index(1, 3), Some(column_index));
         bytes[block_index] = 42;
         bytes[LEGACY_TERRAIN_BLOCK_DATA_OFFSET + block_index / 2] = 0xba;
         bytes[LEGACY_TERRAIN_SKY_LIGHT_OFFSET + block_index / 2] = 0xc7;
@@ -1337,16 +1754,25 @@ mod tests {
         bytes[LEGACY_TERRAIN_HEIGHTMAP_OFFSET + column_index] = 99;
         bytes[LEGACY_TERRAIN_BIOME_OFFSET + column_index * 4
             ..LEGACY_TERRAIN_BIOME_OFFSET + column_index * 4 + 4]
-            .copy_from_slice(&0x00ab_cdef_u32.to_le_bytes());
+            .copy_from_slice(&[12, 0xab, 0xcd, 0xef]);
 
         let terrain = LegacyTerrain::parse(Bytes::from(bytes)).expect("legacy terrain");
 
         assert_eq!(terrain.block_id_at(1, 2, 3), Some(42));
-        assert_eq!(terrain.block_data_at(1, 2, 3), Some(0x0b));
-        assert_eq!(terrain.sky_light_at(1, 2, 3), Some(0x0c));
-        assert_eq!(terrain.block_light_at(1, 2, 3), Some(0x0d));
+        assert_eq!(terrain.block_data_at(1, 2, 3), Some(0x0a));
+        assert_eq!(terrain.sky_light_at(1, 2, 3), Some(0x07));
+        assert_eq!(terrain.block_light_at(1, 2, 3), Some(0x05));
         assert_eq!(terrain.height_at(1, 3), Some(99));
         assert_eq!(terrain.biome_color_at(1, 3), Some(0x00ab_cdef));
+        assert_eq!(
+            terrain.biome_sample_at(1, 3),
+            Some(LegacyBiomeSample {
+                biome_id: 12,
+                red: 0xab,
+                green: 0xcd,
+                blue: 0xef,
+            })
+        );
         assert!(LegacyTerrain::parse(Bytes::from_static(b"short")).is_err());
     }
 
@@ -1355,10 +1781,11 @@ mod tests {
         let mut bytes = vec![0; LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN];
         bytes[0] = 2;
         let index = LegacySubChunk::block_index(4, 5, 6).expect("block index");
+        assert_eq!(index, 1_125);
         bytes[1 + index] = 7;
-        bytes[1 + LEGACY_SUBCHUNK_BLOCK_COUNT + index / 2] = 0x0c;
-        bytes[1 + LEGACY_SUBCHUNK_BLOCK_COUNT + LEGACY_SUBCHUNK_BLOCK_COUNT / 2 + index / 2] = 0x0e;
-        bytes[1 + LEGACY_SUBCHUNK_BLOCK_COUNT + LEGACY_SUBCHUNK_BLOCK_COUNT + index / 2] = 0x0a;
+        bytes[1 + LEGACY_SUBCHUNK_BLOCK_COUNT + index / 2] = 0xc0;
+        bytes[1 + LEGACY_SUBCHUNK_BLOCK_COUNT + LEGACY_SUBCHUNK_BLOCK_COUNT / 2 + index / 2] = 0xe0;
+        bytes[1 + LEGACY_SUBCHUNK_BLOCK_COUNT + LEGACY_SUBCHUNK_BLOCK_COUNT + index / 2] = 0xa0;
 
         let subchunk = parse_subchunk(0, Bytes::from(bytes)).expect("parse legacy subchunk");
 
@@ -1433,6 +1860,54 @@ mod tests {
     }
 
     #[test]
+    fn paletted_subchunk_v9_accepts_positive_embedded_y_that_looks_like_storage_header() {
+        let bytes = build_paletted_subchunk(9, Some(8), 4, 4);
+
+        let subchunk = parse_subchunk(8, Bytes::from(bytes)).expect("parse");
+
+        let SubChunkFormat::Paletted { storages, .. } = &subchunk.format else {
+            panic!("expected paletted v9 subchunk");
+        };
+        assert_eq!(storages[0].states.len(), 4);
+        assert_eq!(
+            subchunk
+                .block_state_at(1, 2, 3)
+                .expect("block state at x=1 y=2 z=3")
+                .name,
+            "minecraft:block_2"
+        );
+    }
+
+    #[test]
+    fn paletted_subchunk_v9_falls_back_to_legacy_layout_without_embedded_y() {
+        let bytes = build_paletted_subchunk(9, None, 4, 4);
+
+        let subchunk = parse_subchunk(8, Bytes::from(bytes)).expect("parse");
+
+        let SubChunkFormat::Paletted { storages, .. } = &subchunk.format else {
+            panic!("expected paletted v9 subchunk");
+        };
+        assert_eq!(storages[0].states.len(), 4);
+        assert_eq!(
+            subchunk
+                .block_state_at(1, 2, 3)
+                .expect("block state at x=1 y=2 z=3")
+                .name,
+            "minecraft:block_2"
+        );
+    }
+
+    #[test]
+    fn paletted_subchunk_rejects_trailing_bytes_after_storage_payload() {
+        let mut bytes = build_paletted_subchunk(8, None, 4, 4);
+        bytes.push(0);
+
+        let subchunk = parse_subchunk(0, Bytes::from(bytes)).expect("parse");
+
+        assert!(matches!(subchunk.format, SubChunkFormat::Raw { .. }));
+    }
+
+    #[test]
     fn block_state_lookup_uses_xz_plane_storage_order() {
         let bytes = build_paletted_subchunk(8, None, 4, 8);
         let subchunk = parse_subchunk(0, Bytes::from(bytes)).expect("parse");
@@ -1445,6 +1920,73 @@ mod tests {
         assert_eq!(
             state.name,
             format!("minecraft:block_{}", block_storage_index(1, 2, 3) % 8)
+        );
+    }
+
+    #[test]
+    fn visible_block_state_lookup_uses_top_non_air_storage() {
+        let subchunk = parse_subchunk(
+            0,
+            Bytes::from(build_two_storage_paletted_subchunk(
+                "minecraft:stone",
+                "minecraft:copper_block",
+            )),
+        )
+        .expect("parse layered subchunk");
+
+        assert_eq!(
+            subchunk
+                .block_state_at(1, 2, 3)
+                .expect("storage zero state")
+                .name,
+            "minecraft:stone"
+        );
+        let visible = subchunk
+            .visible_block_states_at(1, 2, 3)
+            .map(|state| state.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible, ["minecraft:copper_block", "minecraft:stone"]);
+        assert_eq!(
+            subchunk
+                .visible_block_state_at(1, 2, 3)
+                .expect("visible state")
+                .name,
+            "minecraft:copper_block"
+        );
+    }
+
+    #[test]
+    fn paletted_subchunk_v9_decodes_zero_bit_secondary_storage_without_palette_len() {
+        let mut bytes = vec![9, 2, 4];
+        append_test_palette_storage(
+            &mut bytes,
+            &["minecraft:air", "minecraft:stone"],
+            |x, y, z| u16::from((x, y, z) == (4, 2, 4)),
+        );
+        append_zero_bit_palette_storage(&mut bytes, "minecraft:gold_block");
+
+        let subchunk = parse_subchunk(4, Bytes::from(bytes)).expect("parse v9 layered subchunk");
+
+        let SubChunkFormat::Paletted { storages, .. } = &subchunk.format else {
+            panic!("expected paletted subchunk");
+        };
+        assert_eq!(storages.len(), 2);
+        assert_eq!(storages[1].states.len(), 1);
+        assert_eq!(storages[1].counts, [4096]);
+        assert_eq!(
+            subchunk
+                .block_state_at(4, 2, 4)
+                .expect("storage zero state")
+                .name,
+            "minecraft:stone"
+        );
+        assert_eq!(
+            subchunk
+                .visible_block_state_at(4, 2, 4)
+                .expect("visible state")
+                .name,
+            "minecraft:gold_block"
         );
     }
 
@@ -1499,11 +2041,13 @@ mod tests {
         for word in words {
             bytes.extend_from_slice(&word.to_le_bytes());
         }
-        bytes.extend_from_slice(
-            &i32::try_from(palette_len)
-                .expect("palette length")
-                .to_le_bytes(),
-        );
+        if bits_per_block != 0 {
+            bytes.extend_from_slice(
+                &i32::try_from(palette_len)
+                    .expect("palette length")
+                    .to_le_bytes(),
+            );
+        }
         for index in 0..palette_len {
             let tag = NbtTag::Compound(IndexMap::from([
                 (
@@ -1516,5 +2060,67 @@ mod tests {
             bytes.extend_from_slice(&serialize_root_nbt(&tag).expect("serialize palette"));
         }
         bytes
+    }
+
+    fn append_zero_bit_palette_storage(bytes: &mut Vec<u8>, name: &str) {
+        bytes.push(0);
+        let tag = NbtTag::Compound(IndexMap::from([
+            ("name".to_string(), NbtTag::String(name.to_string())),
+            ("states".to_string(), NbtTag::Compound(IndexMap::new())),
+            ("version".to_string(), NbtTag::Int(1)),
+        ]));
+        bytes.extend_from_slice(&serialize_root_nbt(&tag).expect("serialize palette"));
+    }
+
+    fn build_two_storage_paletted_subchunk(lower_name: &str, upper_name: &str) -> Vec<u8> {
+        let mut bytes = vec![8, 2];
+        append_test_palette_storage(&mut bytes, &["minecraft:air", lower_name], |x, y, z| {
+            u16::from((x, y, z) == (1, 2, 3))
+        });
+        append_test_palette_storage(&mut bytes, &["minecraft:air", upper_name], |x, y, z| {
+            u16::from((x, y, z) == (1, 2, 3))
+        });
+        bytes
+    }
+
+    fn append_test_palette_storage(
+        bytes: &mut Vec<u8>,
+        palette: &[&str],
+        value_at: impl Fn(u8, u8, u8) -> u16,
+    ) {
+        let bits_per_block = 1_u8;
+        let values_per_word = usize::from(32 / bits_per_block);
+        let mut words = vec![0_u32; packed_word_count(bits_per_block)];
+        for local_z in 0..16_u8 {
+            for local_x in 0..16_u8 {
+                for local_y in 0..16_u8 {
+                    let value = value_at(local_x, local_y, local_z);
+                    if value == 0 {
+                        continue;
+                    }
+                    let block_index = block_storage_index(local_x, local_y, local_z);
+                    let word_index = block_index / values_per_word;
+                    let bit_offset = (block_index % values_per_word) * usize::from(bits_per_block);
+                    words[word_index] |= u32::from(value) << bit_offset;
+                }
+            }
+        }
+        bytes.push(bits_per_block << 1);
+        for word in words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(
+            &i32::try_from(palette.len())
+                .expect("test palette length")
+                .to_le_bytes(),
+        );
+        for name in palette {
+            let tag = NbtTag::Compound(IndexMap::from([
+                ("name".to_string(), NbtTag::String((*name).to_string())),
+                ("states".to_string(), NbtTag::Compound(IndexMap::new())),
+                ("version".to_string(), NbtTag::Int(1)),
+            ]));
+            bytes.extend_from_slice(&serialize_root_nbt(&tag).expect("serialize palette"));
+        }
     }
 }

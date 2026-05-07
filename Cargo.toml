@@ -1,6 +1,6 @@
 [package]
 name = "bedrock-world"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
 license = "MIT OR Apache-2.0"
@@ -35,6 +35,7 @@ path = "src/bedrock_world.rs"
 default = ["async", "backend-bedrock-leveldb"]
 async = ["dep:tokio"]
 backend-bedrock-leveldb = ["dep:bedrock-leveldb"]
+leveldb-mmap = ["backend-bedrock-leveldb", "bedrock-leveldb/mmap"]
 
 [dependencies]
 bedrock-leveldb = { path = "../bedrock-leveldb", optional = true }

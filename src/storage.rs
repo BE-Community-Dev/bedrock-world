@@ -5,9 +5,13 @@
 //! tools, while [`BedrockLevelDbStorage`](crate::BedrockLevelDbStorage) adapts
 //! the `bedrock-leveldb` crate.
 
+use crate::chunk::{ChunkKey, ChunkPos, ChunkRecordTag, Dimension, LEGACY_TERRAIN_VALUE_LEN};
 use crate::error::{BedrockWorldError, Result};
+use crate::level_dat::read_level_dat_document;
+use crate::nbt::NbtTag;
 use bytes::Bytes;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 use std::sync::{
     Arc, RwLock,
@@ -18,6 +22,12 @@ use std::sync::{
 pub struct StorageEntry {
     pub key: Bytes,
     pub value: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageEntryRef<'a> {
+    pub key: &'a [u8],
+    pub value: &'a [u8],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +218,24 @@ impl StorageBatch {
 pub trait WorldStorage: Send + Sync {
     /// Looks up a raw value by exact key.
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
+    /// Looks up raw values by exact key, preserving input order.
+    fn get_many(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>> {
+        keys.iter().map(|key| self.get(key)).collect()
+    }
+    /// Looks up raw values by exact key with read options and cancellation, preserving input order.
+    fn get_many_ordered_with_control(
+        &self,
+        keys: &[Bytes],
+        options: StorageReadOptions,
+    ) -> Result<Vec<Option<Bytes>>> {
+        check_cancelled(&options)?;
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            check_cancelled(&options)?;
+            values.push(self.get(key)?);
+        }
+        Ok(values)
+    }
     /// Writes a raw key/value pair.
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
     /// Deletes a raw key.
@@ -226,6 +254,20 @@ pub trait WorldStorage: Send + Sync {
         options: StorageReadOptions,
         visitor: &mut (dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl> + Send),
     ) -> Result<StorageScanOutcome>;
+    /// Visits key/value records as borrowed byte views.
+    fn for_each_prefix_ref(
+        &self,
+        prefix: &[u8],
+        options: StorageReadOptions,
+        visitor: &mut (dyn FnMut(StorageEntryRef<'_>) -> Result<StorageVisitorControl> + Send),
+    ) -> Result<StorageScanOutcome> {
+        self.for_each_prefix(prefix, options, &mut |key, value| {
+            visitor(StorageEntryRef {
+                key,
+                value: value.as_ref(),
+            })
+        })
+    }
     /// Visits keys whose key starts with `prefix` without requiring value
     /// materialization when the backend can support key-only scans.
     fn for_each_prefix_key(
@@ -268,6 +310,16 @@ impl WorldStorage for MemoryStorage {
             BedrockWorldError::ConcurrentWrite("memory storage poisoned".to_string())
         })?;
         Ok(values.get(key).cloned())
+    }
+
+    fn get_many(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>> {
+        let values = self.values.read().map_err(|_| {
+            BedrockWorldError::ConcurrentWrite("memory storage poisoned".to_string())
+        })?;
+        Ok(keys
+            .iter()
+            .map(|key| values.get(key.as_ref()).cloned())
+            .collect())
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -379,12 +431,275 @@ impl WorldStorage for MemoryStorage {
     }
 }
 
+/// Terrain payload length used by old Pocket Edition `chunks.dat` files before
+/// the 1024-byte `[biome_id, red, green, blue]` tail was added to `LevelDB`
+/// `LegacyTerrain`.
+pub const POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN: usize = 82_176;
+const POCKET_CHUNKS_DAT_LOCATION_TABLE_LEN: usize = 4 * 32 * 32;
+const POCKET_CHUNKS_DAT_SECTOR_BYTES: usize = 4096;
+const DEFAULT_LEGACY_BIOME_SAMPLE: [u8; 4] = [1, 0x7f, 0xb2, 0x38];
+
+#[derive(Debug, Clone)]
+pub struct PocketChunksDatStorage {
+    values: Arc<BTreeMap<Vec<u8>, Bytes>>,
+    origin_chunk_x: i32,
+    origin_chunk_z: i32,
+}
+
+impl PocketChunksDatStorage {
+    pub fn open(world_path: impl AsRef<Path>) -> Result<Self> {
+        let world_path = world_path.as_ref();
+        let chunks_path = world_path.join("chunks.dat");
+        let bytes = fs::read(&chunks_path)?;
+        let (origin_chunk_x, origin_chunk_z) = read_limited_world_origin(world_path);
+        let values = parse_pocket_chunks_dat(&bytes, origin_chunk_x, origin_chunk_z)?;
+        if world_path.join("entities.dat").is_file() {
+            match fs::read(world_path.join("entities.dat")) {
+                Ok(bytes) => log::debug!(
+                    "legacy entities.dat present (bytes={}, parser=best_effort_skip)",
+                    bytes.len()
+                ),
+                Err(error) => log::warn!("failed to read legacy entities.dat: {error}"),
+            }
+        }
+        log::debug!(
+            "opened Pocket chunks.dat storage (chunks={}, origin=({}, {}), path={})",
+            values.len(),
+            origin_chunk_x,
+            origin_chunk_z,
+            chunks_path.display()
+        );
+        Ok(Self {
+            values: Arc::new(values),
+            origin_chunk_x,
+            origin_chunk_z,
+        })
+    }
+
+    #[must_use]
+    pub const fn origin_chunk_x(&self) -> i32 {
+        self.origin_chunk_x
+    }
+
+    #[must_use]
+    pub const fn origin_chunk_z(&self) -> i32 {
+        self.origin_chunk_z
+    }
+}
+
+impl WorldStorage for PocketChunksDatStorage {
+    fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        Ok(self.values.get(key).cloned())
+    }
+
+    fn get_many(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>> {
+        Ok(keys
+            .iter()
+            .map(|key| self.values.get(key.as_ref()).cloned())
+            .collect())
+    }
+
+    fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+        Err(pocket_chunks_dat_read_only_error())
+    }
+
+    fn delete(&self, _key: &[u8]) -> Result<()> {
+        Err(pocket_chunks_dat_read_only_error())
+    }
+
+    fn for_each_key(
+        &self,
+        options: StorageReadOptions,
+        visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
+    ) -> Result<StorageScanOutcome> {
+        let mut outcome = StorageScanOutcome::empty();
+        for (key, value) in self.values.iter() {
+            check_cancelled(&options)?;
+            outcome.record(value.len());
+            if visitor(key)? == StorageVisitorControl::Stop {
+                outcome.stopped = true;
+                return Ok(outcome);
+            }
+            emit_progress(&options, outcome);
+        }
+        Ok(outcome)
+    }
+
+    fn for_each_prefix(
+        &self,
+        prefix: &[u8],
+        options: StorageReadOptions,
+        visitor: &mut (dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl> + Send),
+    ) -> Result<StorageScanOutcome> {
+        let mut outcome = StorageScanOutcome::empty();
+        for (key, value) in self
+            .values
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            check_cancelled(&options)?;
+            outcome.record(value.len());
+            if visitor(key, value)? == StorageVisitorControl::Stop {
+                outcome.stopped = true;
+                return Ok(outcome);
+            }
+            emit_progress(&options, outcome);
+        }
+        Ok(outcome)
+    }
+
+    fn for_each_prefix_key(
+        &self,
+        prefix: &[u8],
+        options: StorageReadOptions,
+        visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
+    ) -> Result<StorageScanOutcome> {
+        let mut outcome = StorageScanOutcome::empty();
+        for (key, value) in self
+            .values
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            check_cancelled(&options)?;
+            outcome.record(value.len());
+            if visitor(key)? == StorageVisitorControl::Stop {
+                outcome.stopped = true;
+                return Ok(outcome);
+            }
+            emit_progress(&options, outcome);
+        }
+        Ok(outcome)
+    }
+
+    fn write_batch(&self, _batch: &StorageBatch) -> Result<()> {
+        Err(pocket_chunks_dat_read_only_error())
+    }
+
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn parse_pocket_chunks_dat(
+    bytes: &[u8],
+    origin_chunk_x: i32,
+    origin_chunk_z: i32,
+) -> Result<BTreeMap<Vec<u8>, Bytes>> {
+    if bytes.len() < POCKET_CHUNKS_DAT_LOCATION_TABLE_LEN {
+        return Err(BedrockWorldError::CorruptWorld(format!(
+            "chunks.dat is too small for its location table: {} bytes",
+            bytes.len()
+        )));
+    }
+    let mut values = BTreeMap::new();
+    for index in 0..(32 * 32) {
+        let entry_offset = index * 4;
+        let entry = &bytes[entry_offset..entry_offset + 4];
+        if entry == [0, 0, 0, 0] {
+            continue;
+        }
+        let sector_count = usize::from(entry[0]);
+        let sector_offset =
+            usize::from(entry[1]) | (usize::from(entry[2]) << 8) | (usize::from(entry[3]) << 16);
+        if sector_count == 0 || sector_offset == 0 {
+            continue;
+        }
+        let Some(byte_offset) = sector_offset.checked_mul(POCKET_CHUNKS_DAT_SECTOR_BYTES) else {
+            continue;
+        };
+        let Some(payload) = pocket_chunk_payload(bytes, byte_offset, sector_count) else {
+            log::warn!(
+                "skipping invalid chunks.dat entry (index={index}, sector_offset={sector_offset}, sector_count={sector_count})"
+            );
+            continue;
+        };
+        let local_x = i32::try_from(index % 32).unwrap_or(0);
+        let local_z = i32::try_from(index / 32).unwrap_or(0);
+        let pos = ChunkPos {
+            x: origin_chunk_x.saturating_add(local_x),
+            z: origin_chunk_z.saturating_add(local_z),
+            dimension: Dimension::Overworld,
+        };
+        values.insert(
+            ChunkKey::new(pos, ChunkRecordTag::LegacyTerrain)
+                .encode()
+                .to_vec(),
+            convert_pocket_terrain_to_legacy(payload),
+        );
+    }
+    Ok(values)
+}
+
+fn pocket_chunk_payload(bytes: &[u8], byte_offset: usize, sector_count: usize) -> Option<&[u8]> {
+    let sector_bytes = sector_count.checked_mul(POCKET_CHUNKS_DAT_SECTOR_BYTES)?;
+    let max_end = byte_offset.checked_add(sector_bytes)?.min(bytes.len());
+    if byte_offset >= bytes.len() || byte_offset >= max_end {
+        return None;
+    }
+    let available = &bytes[byte_offset..max_end];
+    if available.len() >= 4 {
+        let declared_len = u32::from_le_bytes(available[0..4].try_into().ok()?) as usize;
+        if declared_len == POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN
+            && available.len() >= 4 + declared_len
+        {
+            return Some(&available[4..4 + declared_len]);
+        }
+        if declared_len == LEGACY_TERRAIN_VALUE_LEN && available.len() >= 4 + declared_len {
+            return Some(&available[4..4 + POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN]);
+        }
+    }
+    if available.len() >= POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN {
+        return Some(&available[..POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN]);
+    }
+    None
+}
+
+fn convert_pocket_terrain_to_legacy(payload: &[u8]) -> Bytes {
+    if payload.len() == LEGACY_TERRAIN_VALUE_LEN {
+        return Bytes::copy_from_slice(payload);
+    }
+    let mut legacy = Vec::with_capacity(LEGACY_TERRAIN_VALUE_LEN);
+    legacy.extend_from_slice(&payload[..POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN]);
+    for _ in 0..256 {
+        legacy.extend_from_slice(&DEFAULT_LEGACY_BIOME_SAMPLE);
+    }
+    Bytes::from(legacy)
+}
+
+fn read_limited_world_origin(world_path: &Path) -> (i32, i32) {
+    let Ok(document) = read_level_dat_document(&world_path.join("level.dat")) else {
+        return (0, 0);
+    };
+    let NbtTag::Compound(root) = document.root else {
+        return (0, 0);
+    };
+    (
+        nbt_i32(root.get("LimitedWorldOriginX")).unwrap_or(0),
+        nbt_i32(root.get("LimitedWorldOriginZ")).unwrap_or(0),
+    )
+}
+
+fn nbt_i32(tag: Option<&NbtTag>) -> Option<i32> {
+    match tag {
+        Some(NbtTag::Byte(value)) => Some(i32::from(*value)),
+        Some(NbtTag::Short(value)) => Some(i32::from(*value)),
+        Some(NbtTag::Int(value)) => Some(*value),
+        Some(NbtTag::Long(value)) => i32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn pocket_chunks_dat_read_only_error() -> BedrockWorldError {
+    BedrockWorldError::UnsupportedChunkFormat("Pocket chunks.dat storage is read-only".to_string())
+}
+
 pub mod backend {
     use super::*;
 
     #[cfg(feature = "backend-bedrock-leveldb")]
+    #[derive(Clone)]
     pub struct BedrockLevelDbStorage {
-        db: bedrock_leveldb::Db,
+        db: Arc<bedrock_leveldb::Db>,
     }
 
     #[cfg(feature = "backend-bedrock-leveldb")]
@@ -417,7 +732,7 @@ pub mod backend {
                 write_buffer_size: 4 * 1024 * 1024,
             };
             let db = bedrock_leveldb::Db::open(path, options).map_err(map_leveldb_error)?;
-            Ok(Self { db })
+            Ok(Self { db: Arc::new(db) })
         }
     }
 
@@ -425,6 +740,26 @@ pub mod backend {
     impl WorldStorage for BedrockLevelDbStorage {
         fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
             self.db.get(key).map_err(map_leveldb_error)
+        }
+
+        fn get_many(&self, keys: &[Bytes]) -> Result<Vec<Option<Bytes>>> {
+            self.db
+                .get_many_owned(
+                    keys.iter().cloned(),
+                    bedrock_leveldb::ReadOptions::default(),
+                )
+                .map_err(map_leveldb_error)
+        }
+
+        fn get_many_ordered_with_control(
+            &self,
+            keys: &[Bytes],
+            options: StorageReadOptions,
+        ) -> Result<Vec<Option<Bytes>>> {
+            check_cancelled(&options)?;
+            self.db
+                .get_many_owned(keys.iter().cloned(), to_leveldb_read_options(options))
+                .map_err(map_leveldb_error)
         }
 
         fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -482,6 +817,37 @@ pub mod backend {
             let mut visitor_error = None;
             let scan_result = self.db.for_each_prefix(prefix, read_options, |key, value| {
                 match visitor(key, value) {
+                    Ok(StorageVisitorControl::Continue) => {
+                        Ok(bedrock_leveldb::VisitorControl::Continue)
+                    }
+                    Ok(StorageVisitorControl::Stop) => Ok(bedrock_leveldb::VisitorControl::Stop),
+                    Err(error) => {
+                        visitor_error = Some(error);
+                        Ok(bedrock_leveldb::VisitorControl::Stop)
+                    }
+                }
+            });
+            match (scan_result, visitor_error) {
+                (_, Some(error)) => Err(error),
+                (Ok(outcome), None) => Ok(to_storage_outcome(outcome)),
+                (Err(error), None) => Err(map_leveldb_error(error)),
+            }
+        }
+
+        fn for_each_prefix_ref(
+            &self,
+            prefix: &[u8],
+            options: StorageReadOptions,
+            visitor: &mut (dyn FnMut(StorageEntryRef<'_>) -> Result<StorageVisitorControl> + Send),
+        ) -> Result<StorageScanOutcome> {
+            let mut read_options = to_leveldb_read_options(options);
+            read_options.read_strategy = bedrock_leveldb::ReadStrategy::Borrowed;
+            let mut visitor_error = None;
+            let scan_result = self.db.for_each_prefix_ref(prefix, read_options, |entry| {
+                match visitor(StorageEntryRef {
+                    key: entry.key.as_bytes(),
+                    value: entry.value.as_bytes(),
+                }) {
                     Ok(StorageVisitorControl::Continue) => {
                         Ok(bedrock_leveldb::VisitorControl::Continue)
                     }
@@ -561,7 +927,8 @@ pub mod backend {
     fn to_leveldb_read_options(options: StorageReadOptions) -> bedrock_leveldb::ReadOptions {
         bedrock_leveldb::ReadOptions {
             checksum: bedrock_leveldb::ChecksumMode::Inherit,
-            cache_policy: bedrock_leveldb::CachePolicy::Use,
+            cache_policy: bedrock_leveldb::CachePolicy::Bypass,
+            read_strategy: bedrock_leveldb::ReadStrategy::Shared,
             threading: match options.threading {
                 StorageThreadingOptions::Auto => bedrock_leveldb::ThreadingOptions::Auto,
                 StorageThreadingOptions::Fixed(threads) => {
@@ -629,6 +996,12 @@ pub mod backend {
     #[cfg(not(feature = "backend-bedrock-leveldb"))]
     impl WorldStorage for BedrockLevelDbStorage {
         fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+            Err(BedrockWorldError::LevelDb(
+                "backend-bedrock-leveldb feature is disabled".to_string(),
+            ))
+        }
+
+        fn get_many(&self, _keys: &[Bytes]) -> Result<Vec<Option<Bytes>>> {
             Err(BedrockWorldError::LevelDb(
                 "backend-bedrock-leveldb feature is disabled".to_string(),
             ))
@@ -769,6 +1142,80 @@ mod tests {
             )
             .expect("scan");
         assert_eq!(player_count, 2);
+
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[test]
+    fn pocket_chunks_dat_exposes_virtual_legacy_terrain_records() {
+        let path = std::env::temp_dir().join(format!(
+            "bedrock-world-pocket-chunks-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("create world dir");
+        let mut terrain = vec![0_u8; POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN];
+        let block_index = (1_usize << 11) | (3_usize << 7) | 2_usize;
+        let column_index = 3_usize * 16 + 1_usize;
+        terrain[block_index] = 42;
+        terrain[crate::LEGACY_TERRAIN_BLOCK_COUNT
+            + (crate::LEGACY_TERRAIN_BLOCK_COUNT / 2) * 3
+            + column_index] = 99;
+        let mut chunks = vec![0_u8; POCKET_CHUNKS_DAT_SECTOR_BYTES];
+        chunks[0] = 21;
+        chunks[1] = 1;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN as u32).to_le_bytes());
+        payload.extend_from_slice(&terrain);
+        chunks.extend_from_slice(&payload);
+        let padded_len = POCKET_CHUNKS_DAT_SECTOR_BYTES * 22;
+        chunks.resize(padded_len, 0);
+        std::fs::write(path.join("chunks.dat"), chunks).expect("write chunks.dat");
+
+        let storage = PocketChunksDatStorage::open(&path).expect("open pocket chunks");
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let legacy_key = ChunkKey::new(pos, ChunkRecordTag::LegacyTerrain).encode();
+        let missing_key = ChunkKey::new(
+            ChunkPos {
+                x: 1,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            ChunkRecordTag::LegacyTerrain,
+        )
+        .encode();
+
+        let values = storage
+            .get_many(&[missing_key.clone(), legacy_key.clone()])
+            .expect("get many");
+        assert!(values[0].is_none());
+        let Some(value) = &values[1] else {
+            panic!("legacy terrain should be present");
+        };
+        assert_eq!(value.len(), LEGACY_TERRAIN_VALUE_LEN);
+        assert_eq!(
+            &value[..POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN],
+            terrain.as_slice()
+        );
+        let terrain = crate::LegacyTerrain::parse(value.clone()).expect("legacy terrain");
+        assert_eq!(terrain.block_id_at(1, 2, 3), Some(42));
+        assert_eq!(terrain.height_at(1, 3), Some(99));
+
+        let mut keys = Vec::new();
+        storage
+            .for_each_key(StorageReadOptions::default(), &mut |key| {
+                keys.push(Bytes::copy_from_slice(key));
+                Ok(StorageVisitorControl::Continue)
+            })
+            .expect("scan keys");
+        assert_eq!(keys, vec![legacy_key]);
+        assert!(storage.put(b"x", b"y").is_err());
 
         std::fs::remove_dir_all(path).expect("cleanup");
     }

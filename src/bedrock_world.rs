@@ -40,18 +40,20 @@ pub mod nbt;
 pub mod parsed;
 /// Player identifiers and raw player record helpers.
 pub mod player;
+/// Professional map query helpers and guarded world edits.
+pub mod query;
 /// Storage abstraction and LevelDB backend adapters.
 pub mod storage;
 /// High-level lazy world handle and scan/render helpers.
 pub mod world;
 
 pub use chunk::{
-    BedrockDbKey, BlockPalette, BlockPos, BlockState, Chunk, ChunkKey, ChunkPos, ChunkRecord,
-    ChunkRecordTag, ChunkVersion, Dimension, EntityData, LEGACY_SUBCHUNK_BLOCK_COUNT,
-    LEGACY_SUBCHUNK_MIN_VALUE_LEN, LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN,
-    LEGACY_TERRAIN_BLOCK_COUNT, LEGACY_TERRAIN_VALUE_LEN, LegacySubChunk, LegacyTerrain,
-    ParsedVillageKey, SubChunk, SubChunkDecodeMode, SubChunkFormat, VillageRecordKind,
-    block_storage_index,
+    ActorDigestKey, ActorUid, BedrockDbKey, BlockPalette, BlockPos, BlockState, Chunk, ChunkKey,
+    ChunkPos, ChunkRecord, ChunkRecordTag, ChunkVersion, Dimension, EntityData, GlobalRecordKind,
+    LEGACY_SUBCHUNK_BLOCK_COUNT, LEGACY_SUBCHUNK_MIN_VALUE_LEN,
+    LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN, LEGACY_TERRAIN_BLOCK_COUNT, LEGACY_TERRAIN_VALUE_LEN,
+    LegacyBiomeSample, LegacySubChunk, LegacyTerrain, MapRecordId, ParsedVillageKey, SubChunk,
+    SubChunkDecodeMode, SubChunkFormat, VillageRecordKind, block_storage_index,
 };
 pub use discover::{WorldDiscovery, WorldSummary, discover_worlds};
 pub use error::{BedrockWorldError, BedrockWorldErrorKind, Result};
@@ -61,24 +63,39 @@ pub use level_dat::{
 };
 #[cfg(feature = "async")]
 pub use level_dat::{read_level_dat_async, write_level_dat_atomic_async};
-pub use nbt::{NbtReader, NbtRef, NbtTag, NbtValue, NbtWriter};
+pub use nbt::{NbtEvent, NbtReader, NbtRef, NbtTag, NbtValue, NbtView, NbtWriter};
 pub use parsed::{
-    ActorResolution, HardcodedSpawnAreaKind, ItemStack, ParsedActorDigest, ParsedBiomeData,
-    ParsedBiomeStorage, ParsedBlockEntity, ParsedChunkData, ParsedChunkRecord,
+    ActorRecord, ActorResolution, ActorSource, Biome2d, Biome3d, BlockEntityRecord,
+    HardcodedSpawnAreaKind, HeightMap2d, ItemStack, MapKnownFields, MapPixels, ParsedActorDigest,
+    ParsedBiomeData, ParsedBiomeStorage, ParsedBlockEntity, ParsedChunkData, ParsedChunkRecord,
     ParsedChunkRecordValue, ParsedDbEntry, ParsedDbValue, ParsedEntity, ParsedGlobalData,
     ParsedHardcodedSpawnArea, ParsedMapData, ParsedPlayer, ParsedVillageData, ParsedWorld,
     RetentionMode, WorldParseCategories, WorldParseOptions, WorldParseReport,
 };
 pub use player::{PlayerData, PlayerId};
+pub use query::{
+    BlockEntityOverlay, BlockTip, ChunkDetail, ChunkRecordDetail, EntityOverlay,
+    HardcodedSpawnAreaOverlay, RegionOverlayQuery, RegionOverlayQueryOptions, SelectionStats,
+    SlimeChunkBounds, SlimeChunkWindow, SlimeWindowSize, VillageOverlay, VillageOverlayIndex,
+    WriteGuard, delete_chunks_blocking, is_bedrock_slime_chunk, is_slime_chunk,
+    query_block_tip_blocking, query_chunk_detail_blocking, query_region_overlays_blocking,
+    query_region_overlays_blocking_with_control, query_selection_stats_blocking,
+    query_slime_chunk_windows, write_chunk_record_nbt_blocking,
+};
 pub use storage::{
-    MemoryStorage, StorageBatch, StorageCancelFlag, StorageEntry, StorageOp, StorageProgressSink,
-    StorageReadOptions, StorageScanMode, StorageScanOutcome, StorageScanProgress,
-    StorageThreadingOptions, StorageVisitorControl, WorldStorage, backend::BedrockLevelDbStorage,
+    MemoryStorage, POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN, PocketChunksDatStorage, StorageBatch,
+    StorageCancelFlag, StorageEntry, StorageEntryRef, StorageOp, StoragePipelineOptions,
+    StorageProgressSink, StorageReadOptions, StorageScanMode, StorageScanOutcome,
+    StorageScanProgress, StorageThreadingOptions, StorageVisitorControl, WorldStorage,
+    backend::BedrockLevelDbStorage,
 };
 pub use world::{
-    BedrockWorld, CancelFlag, ChunkBounds, OpenOptions, ProgressSink, RenderBlockEntity,
-    RenderChunkData, RenderChunkLoadOptions, RenderChunkPriority, RenderChunkRegion,
-    RenderLoadStats, RenderRegionData, RenderRegionLoadOptions, RenderSurfaceSubchunkMode,
-    SurfaceColumn, SurfaceColumnOptions, WorldPipelineOptions, WorldScanOptions, WorldScanProgress,
-    WorldThreadingOptions, WorldTransaction,
+    BedrockWorld, CancelFlag, ChunkBounds, ExactSurfaceBiomeLoad, ExactSurfaceSubchunkPolicy,
+    OpenOptions, ProgressSink, RenderBlockEntity, RenderChunkData, RenderChunkLoadOptions,
+    RenderChunkPriority, RenderChunkRegion, RenderChunkRequest, RenderLoadStats, RenderRegionData,
+    RenderRegionLoadOptions, SurfaceColumn, SurfaceColumnOptions, TerrainColumnBiome,
+    TerrainColumnOverlay, TerrainColumnSample, TerrainColumnSamples, TerrainColumnWater,
+    TerrainSampleSource, TerrainSurfaceRole, WorldFormat, WorldFormatHint, WorldPipelineOptions,
+    WorldScanOptions, WorldScanProgress, WorldStorageHandle, WorldThreadingOptions,
+    WorldTransaction, terrain_surface_overlay_alpha, terrain_surface_role,
 };

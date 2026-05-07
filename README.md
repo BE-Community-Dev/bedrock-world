@@ -6,8 +6,11 @@
 `bedrock-leveldb`. It provides fast `level.dat` access, little-endian NBT,
 Bedrock DB key classification, player reads, chunk/subchunk parsing including
 LevelDB-era legacy terrain records, entity and block-entity parsing, item
-extraction, biome summaries, and selected map/village/global record
-classification.
+extraction, biome summaries, and typed map/village/global record access.
+
+The performance model is benchmark-backed rather than "femtosecond" marketing:
+hot paths avoid owned raw-value retention, use borrowed/event NBT views when a
+DOM is not needed, and keep shared cache locks opt-in.
 
 This crate does not generate map images and does not copy image/color generation
 code from `bedrock-dev/bedrock-level`. That project is used only as a parsing
@@ -18,16 +21,34 @@ behavior reference.
 - `read_level_dat(path)` and `write_level_dat_atomic(path, document)` are the
   launcher fast path. They do not open LevelDB.
 - `BedrockWorld::open(path, OpenOptions)` creates a lazy world handle backed by
-  `bedrock-leveldb`; it does not parse the full world.
+  `bedrock-leveldb` or the read-only legacy `chunks.dat` backend; it does not
+  parse the full world.
+- `BedrockWorld<S>` is generic over the storage handle. Compatibility
+  constructors such as `open_blocking`, `open`, and `from_storage` return the
+  dynamic `Arc<dyn WorldStorage>` form. Hot paths can use
+  `BedrockWorld::from_typed_storage` or `BedrockWorld::open_typed_blocking` to
+  keep `BedrockLevelDbStorage` or `MemoryStorage` as the concrete backend.
+- `OpenOptions::format` defaults to `WorldFormatHint::Auto`. Auto opens
+  `db/CURRENT` worlds as LevelDB, marks early `StorageVersion <= 4` worlds as
+  `WorldFormat::LevelDbLegacyTerrain`, and opens pre-LevelDB `chunks.dat` worlds
+  as `WorldFormat::PocketChunksDat`.
 - Use category APIs for UI and tools:
   `classify_keys_blocking`, `list_players_blocking`,
   `list_chunk_positions_blocking`, `parse_chunk_blocking`,
   `parse_subchunk_blocking`, `scan_entities_blocking`,
   `scan_block_entities_blocking`, `scan_items_blocking`, `scan_maps_blocking`,
   `scan_villages_blocking`, and `scan_globals_blocking`.
+- Use typed v0.2 edit APIs for BedrockLevelFormat records:
+  `read_map_record_blocking`, `scan_map_records_blocking`,
+  `write_map_record_blocking`, `read_global_record_blocking`,
+  `scan_global_records_blocking`, `put_hsa_for_chunk_blocking`,
+  `block_entities_in_chunk_blocking`, `edit_block_entity_at_blocking`,
+  `actors_in_chunk_blocking`, and `put_actor_blocking`.
 - Async wrappers use `tokio::task::spawn_blocking`, so disk and decode work does
   not block the foreground async runtime.
 - `WorldScanOptions` controls threading, cancellation, and progress callbacks.
+- `NbtReader::view().events()` provides a borrowed event stream for tools that
+  need to inspect NBT without constructing an owned `NbtTag` DOM.
 - `WorldPipelineOptions` refines the bounded pipeline with queue depth, chunk
   batch size, subchunk decode worker budget, and progress cadence. Zero values
   choose automatic defaults.
@@ -37,14 +58,33 @@ behavior reference.
   `load_render_chunk_blocking`, `load_render_chunks_blocking`, and
   `load_render_region_blocking`. These only read records needed to render
   chunks and can run with bounded parallelism.
+- Render chunk data now carries `legacy_terrain: Option<LegacyTerrain>`,
+  structured `legacy_biomes`, and compatibility `legacy_biome_colors`.
+  `LegacyTerrain` biome samples are decoded as `[biome_id, red, green, blue]`;
+  the compatibility color is exposed as `0x00RRGGBB`. Exact surface sampling
+  prefers those saved legacy RGB samples over conflicting old Data2D/Data3D
+  biome ids and records `legacy_biome_preferred_columns` in load stats.
+  `LegacyTerrain` records
+  are requested through exact batch reads, so 0.16-era LevelDB worlds do not
+  need `Data2D` or `SubChunkPrefix` to be considered renderable.
+- `RenderChunkLoadOptions::request` selects one render load contract:
+  `ExactSurface` computes canonical top-down surface columns, `RawHeightMap`
+  loads only raw height records for diagnostics, and `Layer`/`Biome` load fixed
+  slices. `ExactSurface` exposes `RenderChunkData::column_samples` with the
+  real visual surface block, relief/support block, optional thin overlay, water
+  context, biome sample, and source for every sampled X/Z column.
+- Transition chunks that contain both `LegacyTerrain` and `SubChunkPrefix`
+  keep both records; renderers should prefer subchunk block data and use legacy
+  terrain/biome colors only as fallbacks.
 - `parse_world_blocking(WorldParseOptions)` is an explicit advanced/offline API,
   not a launcher default path.
 - Public fallible APIs return `bedrock_world::Result<T>`. Match
   `BedrockWorldError::kind()` for stable categories such as read-only handles,
   cancellation, malformed NBT, unsupported chunk formats, and backend errors.
 
-More detailed API and testing notes are in [`docs/API.md`](docs/API.md) and
-[`docs/TESTING.md`](docs/TESTING.md).
+More detailed API, testing, and benchmark notes are in
+[`docs/API.md`](docs/API.md), [`docs/TESTING.md`](docs/TESTING.md), and
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ```rust
 use bedrock_world::{
@@ -93,6 +133,18 @@ keeps counts and structured summaries while avoiding raw value retention.
   `list_render_chunk_positions_in_region_blocking` or its async wrapper before
   loading render chunks. This probes each visible chunk with key-only prefix
   scans and skips chunks that have no render records.
+- For interactive tile rendering, `load_render_chunks_with_stats_blocking` uses
+  exact `get_many` requests for `LegacyTerrain`, biome records, subchunks, and
+  block entities. `RenderLoadStats::prefix_scans` should remain `0` on this
+  exact path; `legacy_terrain_records`, `legacy_biome_samples`,
+  `legacy_biome_colors`,
+  `terrain_source_legacy`, `terrain_source_subchunk`, `legacy_pocket_chunks`,
+  and `detected_format` identify old-world and transition-world loads.
+- Exact render chunk batches preserve the association between every requested
+  `ChunkPos` and its records even when the input is shuffled, duplicated, or
+  resorted by `RenderChunkPriority`. If a renderer shows chunk-level visual
+  scrambling, compare these exact-batch stats with renderer placement
+  diagnostics before changing parser coordinate formulas.
 - Chunk parsing uses prefix scans and the LevelDB native block cache; repeated
   sample chunk reads avoid full table scans.
 - Default world scans use automatic bounded parallel table scanning. Use
@@ -107,6 +159,36 @@ keeps counts and structured summaries while avoiding raw value retention.
   time.
 - Long scans can be cancelled through `CancelFlag` and can report progress
   through `ProgressSink`.
+
+### Current Large Fixture Baseline
+
+Local run on Windows, Rust bench profile, `2026-05-03`, fixture
+`C:\Users\Administrator\Desktop\BE-Community-Dev\bedrock-world\tests\fixtures\sample-bedrock-world`.
+The fixture is local-only data and is not a CI contract.
+
+Latest large-fixture numbers are tracked in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+## Legacy World Formats
+
+`bedrock-world` keeps LevelDB and pre-LevelDB worlds behind the same
+`WorldStorage` abstraction:
+
+- `WorldFormat::LevelDb` for current Bedrock LevelDB worlds.
+- `WorldFormat::LevelDbLegacyTerrain` for old LevelDB worlds whose renderable
+  chunk data is stored in `LegacyTerrain` tag `0x30`.
+- `WorldFormat::PocketChunksDat` for old Pocket Edition worlds with
+  `chunks.dat`. The `PocketChunksDatStorage` backend is read-only and exposes
+  each terrain payload as a virtual `LegacyTerrain` record. Mutating methods
+  return `UnsupportedChunkFormat`.
+
+```rust
+let world = bedrock_world::BedrockWorld::open_blocking(
+    "path/to/minecraftWorld",
+    bedrock_world::OpenOptions::default(),
+)?;
+println!("detected format: {:?}", world.format());
+```
 
 ### Migration: full chunk scan to viewport render index
 
@@ -189,31 +271,10 @@ players.count=290
 
 ## Benchmark Results
 
-Last local run:
-
-```text
-cargo bench -p bedrock-world
-
-large_fixture.level_dat elapsed_ms=0 version=10 payload_len=2889
-large_fixture.db.open_lazy elapsed_ms=1
-large_fixture.classify_keys.single elapsed_ms=14097 entries=4571643 entries_per_sec=324287.69
-large_fixture.players elapsed_ms=54 count=290
-large_fixture.sample_chunk elapsed_ms=48 records=17 subchunks=9 block_entities=0 parse_errors=0
-
-bedrock_world/level_dat/parse_synthetic            [357.45 ns 364.34 ns 374.54 ns]
-bedrock_world/level_dat/read_fixture               [53.089 us 53.509 us 53.942 us]
-bedrock_world/db/open_lazy                         [765.74 us 776.76 us 794.67 us]
-bedrock_world/world/list_players                   [37.395 ms 37.947 ms 39.316 ms]
-bedrock_world/subchunk/decode_palette_full_indices [35.651 us 35.934 us 36.196 us]
-bedrock_world/subchunk/decode_palette_counts_only  [36.772 us 37.286 us 38.240 us]
-bedrock_world/chunk/parse_fixture_chunk            [37.881 ms 38.514 ms 40.018 ms]
-```
-
-Criterion used the Plotters backend because `gnuplot` was not installed.
-Criterion measurement time is set to 4 seconds so slower fixture-backed benches
-complete without short-sampling warnings. The one-shot large fixture harness is
-intentionally separate from Criterion because multi-million-entry scans should
-not be repeated inside microbenchmarks.
+Latest local Criterion and large-fixture results are tracked in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). The one-shot large fixture harness
+is intentionally separate from Criterion because multi-million-entry scans
+should not be repeated inside microbenchmarks.
 
 ## Completeness
 
@@ -221,12 +282,13 @@ not be repeated inside microbenchmarks.
 | --- | --- |
 | `level.dat` header, warning, atomic write | Implemented |
 | Bedrock little-endian NBT and consecutive roots | Implemented |
-| DB key classification | Implemented for chunk, player, actor, digp, map, village, and common global keys |
+| DB key classification | Implemented for chunk, player, actorprefix, digp, map, village, local player aliases, and common global keys |
 | Legacy `LegacyTerrain` records | Implemented for 83,200-byte LevelDB-era terrain values |
 | Legacy subchunk block arrays | Implemented for v0 and v2-v7 pre-paletted `SubChunkPrefix` values |
 | Subchunk v1/v8/v9 palette parsing | Implemented, counts-only and full-indices modes |
-| Data2D/Data3D biome summary | Implemented |
-| `digp -> actorprefix` actor resolution | Implemented, configurable |
+| Data2D/Data3D biome and heightmap codecs | Implemented |
+| HSA, map, global, actor, and block-entity writes | Implemented with roundtrip validation |
+| `digp -> actorprefix` actor resolution | Implemented, configurable, with transactional modern actor writes |
 | Players, entities, block entities, item stacks | Implemented common field extraction |
 | Unknown version-specific data | Preserved or counted according to retention mode |
 | Full structured editing for every chunk version | Not implemented |
