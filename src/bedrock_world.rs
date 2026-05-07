@@ -11,7 +11,15 @@
 //! [`BedrockWorld::parse_chunk_blocking`], or [`BedrockWorld::scan_items_blocking`].
 //! Async wrappers use `tokio::task::spawn_blocking` so `LevelDB` and NBT work does
 //! not run on foreground async tasks.
+//!
+//! # Features
+//!
+//! docs.rs builds this crate with all features enabled. Default builds enable
+//! `async` and the `bedrock-leveldb` backend. Disable default features for
+//! pure parsing, in-memory storage, `level.dat`, and NBT workflows that should
+//! not depend on a database backend.
 
+#![deny(missing_docs)]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,

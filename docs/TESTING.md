@@ -43,6 +43,20 @@ block, overlay/water context when present, and
 `RenderLoadStats::raw_height_mismatch_columns` is non-zero. Raw heightmap
 behavior belongs in `RenderChunkRequest::RawHeightMap` tests.
 
+Typed write tests should cover the storage-layer contract only:
+
+- `OpenOptions::default()` remains read-only and every high-level write returns
+  `BedrockWorldErrorKind::ReadOnly` before mutating storage.
+- Writable worlds are opened with
+  `OpenOptions { read_only: false, ..OpenOptions::default() }`.
+- map/global/HSA/heightmap/biome/block-entity writes serialize, parse back, and
+  read back with semantic equivalence.
+- actor writes update `digp -> actorprefix` records in one transaction.
+- `PocketChunksDatStorage` rejects `put`, `delete`, and batch writes.
+
+Do not add presentation-layer invalidation assertions here. Post-write refresh
+and scheduling behavior is a downstream responsibility.
+
 ## Benchmarks
 
 Run the v0.2 benchmark set with:

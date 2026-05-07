@@ -31,18 +31,32 @@ This crate focuses on complete parsing behavior. The
   `db/CURRENT` worlds as LevelDB, marks early `StorageVersion <= 4` worlds as
   `WorldFormat::LevelDbLegacyTerrain`, and opens pre-LevelDB `chunks.dat` worlds
   as `WorldFormat::PocketChunksDat`.
+- `OpenOptions::default()` is read-only. Any world-record write must reopen the
+  world with `OpenOptions { read_only: false, ..OpenOptions::default() }`.
+  Read-only worlds return `BedrockWorldErrorKind::ReadOnly` from high-level
+  writes before touching storage.
 - Use category APIs for UI and tools:
   `classify_keys_blocking`, `list_players_blocking`,
   `list_chunk_positions_blocking`, `parse_chunk_blocking`,
   `parse_subchunk_blocking`, `scan_entities_blocking`,
   `scan_block_entities_blocking`, `scan_items_blocking`, `scan_maps_blocking`,
   `scan_villages_blocking`, and `scan_globals_blocking`.
-- Use typed v0.2 edit APIs for BedrockLevelFormat records:
-  `read_map_record_blocking`, `scan_map_records_blocking`,
-  `write_map_record_blocking`, `read_global_record_blocking`,
-  `scan_global_records_blocking`, `put_hsa_for_chunk_blocking`,
-  `block_entities_in_chunk_blocking`, `edit_block_entity_at_blocking`,
-  `actors_in_chunk_blocking`, and `put_actor_blocking`.
+- Use typed v0.2 BedrockLevelFormat write APIs on a writable world:
+  `write_map_record_blocking`, `delete_map_record_blocking`,
+  `write_global_record_blocking`, `delete_global_record_blocking`,
+  `put_heightmap_blocking`, `put_biome_storage_blocking`,
+  `put_hsa_for_chunk_blocking`, `delete_hsa_for_chunk_blocking`,
+  `put_block_entities_blocking`, `edit_block_entity_at_blocking`,
+  `delete_block_entity_at_blocking`, `put_actor_blocking`,
+  `delete_actor_blocking`, and `move_actor_blocking`. Matching async wrappers
+  are available behind the default `async` feature.
+- High-level writes serialize and parse records back before commit. Actor writes
+  update `digp -> actorprefix` records in one transaction. Block-entity writes
+  validate coordinates against the target chunk. `PocketChunksDatStorage`
+  remains read-only.
+- `bedrock-world` stops at Bedrock key/value semantics. Post-write refresh,
+  invalidation, and presentation policy belong to downstream applications or
+  adapter crates.
 - Async wrappers use `tokio::task::spawn_blocking`, so disk and decode work does
   not block the foreground async runtime.
 - `WorldScanOptions` controls threading, cancellation, and progress callbacks.
@@ -274,6 +288,22 @@ Latest local Criterion and large-fixture results are tracked in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). The one-shot large fixture harness
 is intentionally separate from Criterion because multi-million-entry scans
 should not be repeated inside microbenchmarks.
+
+## Features And docs.rs
+
+docs.rs builds with all features enabled, so the hosted API reference includes
+async wrappers and the optional `bedrock-leveldb` backend.
+
+| Feature | Default | Meaning |
+| --- | --- | --- |
+| `async` | yes | Adds async wrappers that delegate blocking filesystem, LevelDB, and NBT work to `tokio::task::spawn_blocking` |
+| `backend-bedrock-leveldb` | yes | Enables opening native Bedrock LevelDB worlds through `bedrock-leveldb` |
+| `leveldb-mmap` | no | Enables the backend and forwards the `bedrock-leveldb/mmap` feature |
+
+Disable default features when a tool only needs pure parsing, in-memory storage,
+`level.dat`, or NBT helpers. The crates.io package includes the English and
+Chinese READMEs, guide documents under `docs/`, the changelog, licenses,
+source, tests, fixture documentation, and benchmarks.
 
 ## Completeness
 

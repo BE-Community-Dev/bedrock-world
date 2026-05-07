@@ -70,6 +70,7 @@ pub struct BlockPos {
 
 impl Dimension {
     #[must_use]
+    /// Returns the numeric Bedrock dimension id.
     pub const fn id(self) -> i32 {
         match self {
             Self::Overworld => 0,
@@ -80,6 +81,7 @@ impl Dimension {
     }
 
     #[must_use]
+    /// Decodes a numeric Bedrock dimension id.
     pub const fn from_id(id: i32) -> Self {
         match id {
             0 => Self::Overworld,
@@ -103,6 +105,7 @@ pub struct ChunkPos {
 
 impl ChunkPos {
     #[must_use]
+    /// Returns the inclusive block Y range for this chunk and version.
     pub const fn y_range(self, version: ChunkVersion) -> (i32, i32) {
         match self.dimension {
             Dimension::Nether => (0, 127),
@@ -116,6 +119,7 @@ impl ChunkPos {
     }
 
     #[must_use]
+    /// Returns the inclusive subchunk Y-index range for this chunk and version.
     pub const fn subchunk_index_range(self, version: ChunkVersion) -> (i8, i8) {
         match self.dimension {
             Dimension::Nether => (0, 7),
@@ -129,6 +133,7 @@ impl ChunkPos {
     }
 
     #[must_use]
+    /// Returns the minimum block position covered by this chunk.
     pub const fn min_block_pos(self, version: ChunkVersion) -> BlockPos {
         let (min_y, _) = self.y_range(version);
         BlockPos {
@@ -139,6 +144,7 @@ impl ChunkPos {
     }
 
     #[must_use]
+    /// Returns the maximum block position covered by this chunk.
     pub const fn max_block_pos(self, version: ChunkVersion) -> BlockPos {
         let (_, max_y) = self.y_range(version);
         BlockPos {
@@ -151,6 +157,7 @@ impl ChunkPos {
 
 impl BlockPos {
     #[must_use]
+    /// Converts this block position to a chunk position in the given dimension.
     pub const fn to_chunk_pos(self, dimension: Dimension) -> ChunkPos {
         let x = if self.x < 0 { self.x - 15 } else { self.x } / 16;
         let z = if self.z < 0 { self.z - 15 } else { self.z } / 16;
@@ -158,6 +165,7 @@ impl BlockPos {
     }
 
     #[must_use]
+    /// Returns local chunk X/Z offsets and the absolute Y coordinate.
     pub const fn in_chunk_offset(self) -> (u8, i32, u8) {
         let mut x = self.x % 16;
         let mut z = self.z % 16;
@@ -178,37 +186,65 @@ pub fn block_storage_index(local_x: u8, local_y: u8, local_z: u8) -> usize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Bedrock chunk record tag byte used in `LevelDB` chunk keys.
 pub enum ChunkRecordTag {
+    /// Modern `Data3D` terrain and biome record.
     Data3D,
+    /// Modern `Data2D` heightmap and biome record.
     Data2D,
+    /// Legacy `Data2D` heightmap and biome record.
     Data2DLegacy,
+    /// Subchunk payload record.
     SubChunkPrefix,
+    /// Old LevelDB-era terrain record.
     LegacyTerrain,
+    /// Block-entity NBT record.
     BlockEntity,
+    /// Legacy inline entity NBT record.
     Entity,
+    /// Pending tick NBT record.
     PendingTicks,
+    /// Block extra-data record.
     BlockExtraData,
+    /// Biome state record.
     BiomeState,
+    /// Finalized state record.
     FinalizedState,
+    /// Chunk conversion data record.
     ConversionData,
+    /// Border blocks record.
     BorderBlocks,
+    /// Hardcoded spawn-area record.
     HardcodedSpawners,
+    /// Random tick record.
     RandomTicks,
+    /// Checksums record.
     Checksums,
+    /// Generation seed record.
     GenerationSeed,
+    /// Metadata hash record.
     MetaDataHash,
+    /// Pre-Caves-and-Cliffs blending marker.
     GeneratedPreCavesAndCliffsBlending,
+    /// Blending biome-height record.
     BlendingBiomeHeight,
+    /// Blending data record.
     BlendingData,
+    /// Actor digest version record.
     ActorDigestVersion,
+    /// Current chunk version record.
     Version,
+    /// Old chunk version record.
     VersionOld,
+    /// Legacy chunk version record.
     LegacyVersion,
+    /// Unknown value preserved for forward compatibility.
     Unknown(u8),
 }
 
 impl ChunkRecordTag {
     #[must_use]
+    /// Returns the raw chunk record tag byte.
     pub const fn byte(self) -> u8 {
         match self {
             Self::Data3D => 0x2b,
@@ -241,6 +277,7 @@ impl ChunkRecordTag {
     }
 
     #[must_use]
+    /// Decodes a raw chunk record tag byte.
     pub const fn from_byte(value: u8) -> Self {
         match value {
             0x2b => Self::Data3D,
@@ -273,6 +310,7 @@ impl ChunkRecordTag {
     }
 
     #[must_use]
+    /// Returns whether this tag can contribute renderable terrain data.
     pub const fn is_render_chunk_record(self) -> bool {
         matches!(
             self,
@@ -299,9 +337,15 @@ pub enum BedrockDbKey {
     /// Remote-player key using the `player_` prefix.
     RemotePlayer(String),
     /// Modern actor payload key `actorprefix<uid>`.
-    ActorPrefix { actor_id: i64 },
+    ActorPrefix {
+        /// Actor id encoded in an `actorprefix` key.
+        actor_id: i64,
+    },
     /// Modern actor digest key `digp<x><z>[dimension]`.
-    ActorDigest { pos: ChunkPos },
+    ActorDigest {
+        /// Chunk position encoded in a `digp` actor digest key.
+        pos: ChunkPos,
+    },
     /// Map data key with the `map_` prefix.
     Map(String),
     /// Village record key.
@@ -325,19 +369,30 @@ pub enum BedrockDbKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Known village record suffix kind.
 pub enum VillageRecordKind {
+    /// Village info record.
     Info,
+    /// Village dwellers record.
     Dwellers,
+    /// Village players record.
     Players,
+    /// Village point-of-interest record.
     Poi,
+    /// Unknown value preserved for forward compatibility.
     Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Parsed village storage key components.
 pub struct ParsedVillageKey {
+    /// Original raw value retained for inspection or roundtrip preservation.
     pub raw: String,
+    /// Bedrock dimension encoded in the village key, when present.
     pub dimension: Option<Dimension>,
+    /// Village UUID component decoded from the key.
     pub uuid: String,
+    /// Classified kind for this record.
     pub kind: VillageRecordKind,
 }
 
@@ -531,6 +586,7 @@ impl GlobalRecordKind {
 
 impl BedrockDbKey {
     #[must_use]
+    /// Decodes this value from Bedrock storage bytes.
     pub fn decode(key: &[u8]) -> Self {
         if key == b"~local_player" {
             return Self::LocalPlayer;
@@ -581,6 +637,7 @@ impl BedrockDbKey {
     }
 
     #[must_use]
+    /// Returns a stable human-readable key category.
     pub fn summary_kind(&self) -> String {
         match self {
             Self::Chunk(key) => format!("Chunk::{:?}", key.tag),
@@ -602,6 +659,7 @@ impl BedrockDbKey {
     }
 
     #[must_use]
+    /// Encodes this value into Bedrock storage bytes.
     pub fn encode(&self) -> Option<Bytes> {
         match self {
             Self::Chunk(key) => Some(key.encode()),
@@ -624,14 +682,19 @@ impl BedrockDbKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Decoded chunk storage key with position, tag, and optional subchunk index.
 pub struct ChunkKey {
+    /// Chunk position encoded in the storage key.
     pub pos: ChunkPos,
+    /// Chunk record tag byte decoded from the key.
     pub tag: ChunkRecordTag,
+    /// Optional subchunk Y index for `SubChunkPrefix` records.
     pub subchunk_y: Option<i8>,
 }
 
 impl ChunkKey {
     #[must_use]
+    /// Creates a non-subchunk chunk key for the given position and record tag.
     pub const fn new(pos: ChunkPos, tag: ChunkRecordTag) -> Self {
         Self {
             pos,
@@ -641,6 +704,7 @@ impl ChunkKey {
     }
 
     #[must_use]
+    /// Creates a `SubChunkPrefix` key for the given vertical subchunk index.
     pub const fn subchunk(pos: ChunkPos, y: i8) -> Self {
         Self {
             pos,
@@ -650,6 +714,7 @@ impl ChunkKey {
     }
 
     #[must_use]
+    /// Encodes this value into Bedrock storage bytes.
     pub fn encode(&self) -> Bytes {
         let mut bytes = Vec::with_capacity(if self.pos.dimension == Dimension::Overworld {
             10
@@ -668,6 +733,7 @@ impl ChunkKey {
         Bytes::from(bytes)
     }
 
+    /// Decodes this value from Bedrock storage bytes.
     pub fn decode(key: &[u8]) -> Result<Self> {
         match key.len() {
             9 | 10 | 13 | 14 => {}
@@ -703,27 +769,39 @@ impl ChunkKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Raw chunk record paired with its decoded chunk key.
 pub struct ChunkRecord {
+    /// Decoded storage key for this record.
     pub key: ChunkKey,
+    /// Parsed or raw value associated with this record.
     pub value: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Block state decoded from a Bedrock palette entry.
 pub struct BlockState {
+    /// Named Bedrock value or identifier.
     pub name: String,
+    /// Palette block states in storage order.
     pub states: BTreeMap<String, NbtTag>,
+    /// Bedrock format or payload version.
     pub version: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Block palette and optional unpacked indices for a subchunk storage.
 pub struct BlockPalette {
+    /// Palette block states in storage order.
     pub states: Vec<BlockState>,
+    /// Optional unpacked palette indices in Bedrock storage order.
     pub indices: Option<Vec<u16>>,
+    /// Per-palette-entry usage counts collected while decoding.
     pub counts: Vec<u16>,
 }
 
 impl BlockPalette {
     #[must_use]
+    /// Returns the decoded palette index at local subchunk coordinates.
     pub fn palette_index_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u16> {
         if local_x >= 16 || local_y >= 16 || local_z >= 16 {
             return None;
@@ -735,6 +813,7 @@ impl BlockPalette {
     }
 
     #[must_use]
+    /// Returns the block state at local subchunk coordinates.
     pub fn block_state_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<&BlockState> {
         let palette_index = usize::from(self.palette_index_at(local_x, local_y, local_z)?);
         self.states.get(palette_index)
@@ -742,35 +821,52 @@ impl BlockPalette {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Controls whether subchunk parsing keeps full indices or counts only.
 pub enum SubChunkDecodeMode {
+    /// Decode palette counts without retaining all block indices.
     CountsOnly,
     #[default]
+    /// Decode and retain full block index arrays.
     FullIndices,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Decoded subchunk payload family.
 pub enum SubChunkFormat {
+    /// Legacy pre-paletted subchunk payload.
     LegacySubChunk(LegacySubChunk),
+    /// Old LevelDB-era terrain record.
     LegacyTerrain,
+    /// Old fixed-array v1 subchunk payload.
     FixedArrayV1,
+    /// Modern paletted subchunk payload.
     Paletted {
+        /// Bedrock format or payload version.
         version: u8,
+        /// Biome or block storages decoded from the record.
         storages: Vec<BlockPalette>,
     },
+    /// Raw bytes preserved because the payload was not decoded.
     Raw {
+        /// Bedrock format or payload version.
         version: Option<u8>,
+        /// Raw payload bytes preserved for unsupported formats.
         bytes: Bytes,
     },
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Decoded subchunk at a vertical subchunk index.
 pub struct SubChunk {
+    /// Vertical subchunk index encoded by the storage key.
     pub y: i8,
+    /// Decoded payload family for this value.
     pub format: SubChunkFormat,
 }
 
 impl SubChunk {
     #[must_use]
+    /// Returns the primary block state at local subchunk coordinates.
     pub fn block_state_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<&BlockState> {
         match &self.format {
             SubChunkFormat::Paletted { storages, .. } => storages
@@ -781,6 +877,7 @@ impl SubChunk {
     }
 
     #[must_use]
+    /// Returns the first visible block state at local subchunk coordinates.
     pub fn visible_block_state_at(
         &self,
         local_x: u8,
@@ -792,6 +889,7 @@ impl SubChunk {
     }
 
     #[must_use]
+    /// Iterates visible block states at local subchunk coordinates from top storage to bottom.
     pub fn visible_block_states_at(
         &self,
         local_x: u8,
@@ -811,6 +909,7 @@ impl SubChunk {
     }
 
     #[must_use]
+    /// Legacy block id at.
     pub fn legacy_block_id_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         match &self.format {
             SubChunkFormat::LegacySubChunk(subchunk) => {
@@ -821,6 +920,7 @@ impl SubChunk {
     }
 
     #[must_use]
+    /// Legacy block data at.
     pub fn legacy_block_data_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         match &self.format {
             SubChunkFormat::LegacySubChunk(subchunk) => {
@@ -831,6 +931,7 @@ impl SubChunk {
     }
 }
 
+/// Iterator over visible block states at a local coordinate.
 pub struct VisibleBlockStatesAt<'chunk> {
     storages: Option<std::iter::Rev<std::slice::Iter<'chunk, BlockPalette>>>,
     local_x: u8,
@@ -872,26 +973,34 @@ fn is_air_block_state_name(name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Legacy biome sample containing biome id and saved RGB components.
 pub struct LegacyBiomeSample {
+    /// Biome id associated with the sampled column.
     pub biome_id: u8,
+    /// Red color component saved by legacy biome data.
     pub red: u8,
+    /// Green color component saved by legacy biome data.
     pub green: u8,
+    /// Blue color component saved by legacy biome data.
     pub blue: u8,
 }
 
 impl LegacyBiomeSample {
     #[must_use]
+    /// Rgb u32.
     pub const fn rgb_u32(self) -> u32 {
         ((self.red as u32) << 16) | ((self.green as u32) << 8) | self.blue as u32
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Decoded view over an old LevelDB-era terrain value.
 pub struct LegacyTerrain {
     bytes: Bytes,
 }
 
 impl LegacyTerrain {
+    /// Parses this value from Bedrock storage bytes.
     pub fn parse(bytes: Bytes) -> Result<Self> {
         if bytes.len() != LEGACY_TERRAIN_VALUE_LEN {
             return Err(BedrockWorldError::UnsupportedChunkFormat(format!(
@@ -903,41 +1012,49 @@ impl LegacyTerrain {
     }
 
     #[must_use]
+    /// Returns the complete raw `LegacyTerrain` value bytes.
     pub fn raw(&self) -> &Bytes {
         &self.bytes
     }
 
     #[must_use]
+    /// Returns the 16x128x16 block id array.
     pub fn block_ids(&self) -> &[u8] {
         &self.bytes[..LEGACY_TERRAIN_BLOCK_COUNT]
     }
 
     #[must_use]
+    /// Returns packed 4-bit block data values.
     pub fn block_data(&self) -> &[u8] {
         &self.bytes[LEGACY_TERRAIN_BLOCK_DATA_OFFSET..LEGACY_TERRAIN_SKY_LIGHT_OFFSET]
     }
 
     #[must_use]
+    /// Returns packed 4-bit sky-light values.
     pub fn sky_light(&self) -> &[u8] {
         &self.bytes[LEGACY_TERRAIN_SKY_LIGHT_OFFSET..LEGACY_TERRAIN_BLOCK_LIGHT_OFFSET]
     }
 
     #[must_use]
+    /// Returns packed 4-bit block-light values.
     pub fn block_light(&self) -> &[u8] {
         &self.bytes[LEGACY_TERRAIN_BLOCK_LIGHT_OFFSET..LEGACY_TERRAIN_HEIGHTMAP_OFFSET]
     }
 
     #[must_use]
+    /// Returns raw heightmap bytes in `z * 16 + x` column order.
     pub fn heightmap(&self) -> &[u8] {
         &self.bytes[LEGACY_TERRAIN_HEIGHTMAP_OFFSET..LEGACY_TERRAIN_BIOME_OFFSET]
     }
 
     #[must_use]
+    /// Returns legacy biome samples as `[biome_id, red, green, blue]` columns.
     pub fn biomes(&self) -> &[u8] {
         &self.bytes[LEGACY_TERRAIN_BIOME_OFFSET..LEGACY_TERRAIN_VALUE_LEN]
     }
 
     #[must_use]
+    /// Returns the legacy terrain block-array index for local coordinates.
     pub fn block_index(local_x: u8, local_y: u8, local_z: u8) -> Option<usize> {
         if local_x < 16 && local_y < 128 && local_z < 16 {
             Some((usize::from(local_x) << 11) | (usize::from(local_z) << 7) | usize::from(local_y))
@@ -947,6 +1064,7 @@ impl LegacyTerrain {
     }
 
     #[must_use]
+    /// Returns the horizontal column index in `z * 16 + x` order.
     pub fn column_index(local_x: u8, local_z: u8) -> Option<usize> {
         if local_x < 16 && local_z < 16 {
             Some(usize::from(local_z) * 16 + usize::from(local_x))
@@ -956,35 +1074,41 @@ impl LegacyTerrain {
     }
 
     #[must_use]
+    /// Returns the legacy numeric block id at local coordinates.
     pub fn block_id_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         Self::block_index(local_x, local_y, local_z)
             .and_then(|index| self.block_ids().get(index).copied())
     }
 
     #[must_use]
+    /// Returns the 4-bit block data value at local coordinates.
     pub fn block_data_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         Self::block_index(local_x, local_y, local_z)
             .and_then(|index| nibble_at(self.block_data(), index))
     }
 
     #[must_use]
+    /// Returns the 4-bit sky-light value at local coordinates.
     pub fn sky_light_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         Self::block_index(local_x, local_y, local_z)
             .and_then(|index| nibble_at(self.sky_light(), index))
     }
 
     #[must_use]
+    /// Returns the 4-bit block-light value at local coordinates.
     pub fn block_light_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         Self::block_index(local_x, local_y, local_z)
             .and_then(|index| nibble_at(self.block_light(), index))
     }
 
     #[must_use]
+    /// Returns the raw terrain heightmap value for a local column.
     pub fn height_at(&self, local_x: u8, local_z: u8) -> Option<u8> {
         Self::column_index(local_x, local_z).and_then(|index| self.heightmap().get(index).copied())
     }
 
     #[must_use]
+    /// Returns the legacy biome sample for a local column.
     pub fn biome_sample_at(&self, local_x: u8, local_z: u8) -> Option<LegacyBiomeSample> {
         let offset = Self::column_index(local_x, local_z)?.checked_mul(4)?;
         let bytes = self.biomes().get(offset..offset + 4)?;
@@ -997,6 +1121,7 @@ impl LegacyTerrain {
     }
 
     #[must_use]
+    /// Returns the legacy RGB biome color for a local column.
     pub fn biome_color_at(&self, local_x: u8, local_z: u8) -> Option<u32> {
         self.biome_sample_at(local_x, local_z)
             .map(LegacyBiomeSample::rgb_u32)
@@ -1004,12 +1129,14 @@ impl LegacyTerrain {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Decoded view over a legacy pre-paletted subchunk payload.
 pub struct LegacySubChunk {
     version: u8,
     bytes: Bytes,
 }
 
 impl LegacySubChunk {
+    /// Parses this value from Bedrock storage bytes.
     pub fn parse(bytes: Bytes) -> Result<Self> {
         let Some(version) = bytes.first().copied() else {
             return Err(BedrockWorldError::UnsupportedChunkFormat(
@@ -1034,16 +1161,19 @@ impl LegacySubChunk {
     }
 
     #[must_use]
+    /// Returns the legacy subchunk payload version byte.
     pub const fn version(&self) -> u8 {
         self.version
     }
 
     #[must_use]
+    /// Returns the complete raw legacy subchunk payload.
     pub fn raw(&self) -> &Bytes {
         &self.bytes
     }
 
     #[must_use]
+    /// Returns the 16x16x16 block id array.
     pub fn block_ids(&self) -> &[u8] {
         let start = 1;
         let end = start + LEGACY_SUBCHUNK_BLOCK_COUNT;
@@ -1051,6 +1181,7 @@ impl LegacySubChunk {
     }
 
     #[must_use]
+    /// Returns packed 4-bit block data values.
     pub fn block_data(&self) -> &[u8] {
         let start = 1 + LEGACY_SUBCHUNK_BLOCK_COUNT;
         let end = start + LEGACY_SUBCHUNK_BLOCK_COUNT / 2;
@@ -1058,6 +1189,7 @@ impl LegacySubChunk {
     }
 
     #[must_use]
+    /// Returns packed 4-bit sky-light values when present.
     pub fn sky_light(&self) -> Option<&[u8]> {
         if self.bytes.len() != LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN {
             return None;
@@ -1068,6 +1200,7 @@ impl LegacySubChunk {
     }
 
     #[must_use]
+    /// Returns packed 4-bit block-light values when present.
     pub fn block_light(&self) -> Option<&[u8]> {
         if self.bytes.len() != LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN {
             return None;
@@ -1077,6 +1210,7 @@ impl LegacySubChunk {
     }
 
     #[must_use]
+    /// Returns the legacy subchunk block-array index for local coordinates.
     pub fn block_index(local_x: u8, local_y: u8, local_z: u8) -> Option<usize> {
         if local_x < 16 && local_y < 16 && local_z < 16 {
             Some(usize::from(local_x) * 256 + usize::from(local_z) * 16 + usize::from(local_y))
@@ -1086,24 +1220,28 @@ impl LegacySubChunk {
     }
 
     #[must_use]
+    /// Returns the legacy numeric block id at local subchunk coordinates.
     pub fn block_id_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         Self::block_index(local_x, local_y, local_z)
             .and_then(|index| self.block_ids().get(index).copied())
     }
 
     #[must_use]
+    /// Returns the 4-bit block data value at local subchunk coordinates.
     pub fn block_data_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         Self::block_index(local_x, local_y, local_z)
             .and_then(|index| nibble_at(self.block_data(), index))
     }
 
     #[must_use]
+    /// Returns the 4-bit sky-light value at local subchunk coordinates.
     pub fn sky_light_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         Self::block_index(local_x, local_y, local_z)
             .and_then(|index| nibble_at(self.sky_light()?, index))
     }
 
     #[must_use]
+    /// Returns the 4-bit block-light value at local subchunk coordinates.
     pub fn block_light_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
         Self::block_index(local_x, local_y, local_z)
             .and_then(|index| nibble_at(self.block_light()?, index))
@@ -1111,18 +1249,25 @@ impl LegacySubChunk {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Entity data data model.
 pub struct EntityData {
+    /// Root NBT tag for the entity payload.
     pub tag: NbtTag,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed chunk with records grouped by position.
 pub struct Chunk {
+    /// Chunk position represented by this parsed chunk.
     pub pos: ChunkPos,
+    /// Bedrock format or payload version.
     pub version: Option<u8>,
+    /// Records included in this result.
     pub records: Vec<ChunkRecord>,
 }
 
 impl Chunk {
+    /// Returns a decoded subchunk by vertical index, when the record is present.
     pub fn get_subchunk(&self, y: i8) -> Result<Option<SubChunk>> {
         let Some(record) = self.records.iter().find(|record| {
             record.key.tag == ChunkRecordTag::SubChunkPrefix && record.key.subchunk_y == Some(y)
@@ -1132,6 +1277,7 @@ impl Chunk {
         parse_subchunk(y, record.value.clone()).map(Some)
     }
 
+    /// Returns the decoded legacy terrain record, when present.
     pub fn legacy_terrain(&self) -> Result<Option<LegacyTerrain>> {
         let Some(record) = self
             .records
@@ -1143,6 +1289,7 @@ impl Chunk {
         LegacyTerrain::parse(record.value.clone()).map(Some)
     }
 
+    /// Get block.
     pub fn get_block(&self, x: u8, y: i16, z: u8) -> Result<BlockState> {
         if x >= 16 || z >= 16 {
             return Err(BedrockWorldError::Validation(format!(
@@ -1201,12 +1348,14 @@ impl Chunk {
         )))
     }
 
+    /// Set block.
     pub fn set_block(&mut self, _x: u8, _y: i16, _z: u8, _block: BlockState) -> Result<()> {
         Err(BedrockWorldError::UnsupportedChunkFormat(
             "structured block editing is not enabled for this chunk format".to_string(),
         ))
     }
 
+    /// Get entities.
     pub fn get_entities(&self) -> Result<Vec<EntityData>> {
         let mut entities = Vec::new();
         for record in self
@@ -1219,6 +1368,7 @@ impl Chunk {
         Ok(entities)
     }
 
+    /// Get block entities.
     pub fn get_block_entities(&self) -> Result<Vec<EntityData>> {
         let mut entities = Vec::new();
         for record in self
@@ -1232,10 +1382,12 @@ impl Chunk {
     }
 }
 
+/// Parse subchunk.
 pub fn parse_subchunk(y: i8, bytes: Bytes) -> Result<SubChunk> {
     parse_subchunk_with_mode(y, bytes, SubChunkDecodeMode::FullIndices)
 }
 
+/// Parse subchunk with mode.
 pub fn parse_subchunk_with_mode(y: i8, bytes: Bytes, mode: SubChunkDecodeMode) -> Result<SubChunk> {
     let version = bytes.first().copied();
     let format = match version {

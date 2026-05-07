@@ -21,6 +21,7 @@ pub enum PlayerId {
 
 impl PlayerId {
     #[must_use]
+    /// Encodes this value as its Bedrock storage key.
     pub fn storage_key(&self) -> Option<Cow<'_, [u8]>> {
         match self {
             Self::Local => Some(Cow::Borrowed(b"~local_player")),
@@ -30,6 +31,7 @@ impl PlayerId {
     }
 
     #[must_use]
+    /// Decodes a Bedrock player storage key.
     pub fn from_storage_key(key: &[u8]) -> Option<Self> {
         if key == b"~local_player" {
             return Some(Self::Local);
@@ -52,11 +54,13 @@ pub struct PlayerData {
 }
 
 impl PlayerData {
+    /// Parses a raw player payload into structured NBT while retaining bytes.
     pub fn from_raw(id: PlayerId, raw: Bytes) -> Result<Self> {
         let nbt = parse_root_nbt(&raw)?;
         Ok(Self { id, nbt, raw })
     }
 
+    /// Serializes structured NBT into a raw player payload.
     pub fn from_nbt(id: PlayerId, nbt: NbtTag) -> Result<Self> {
         let raw = Bytes::from(serialize_root_nbt(&nbt)?);
         Ok(Self { id, nbt, raw })

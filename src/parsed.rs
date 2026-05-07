@@ -48,6 +48,7 @@ pub struct WorldParseOptions {
 
 impl WorldParseOptions {
     #[must_use]
+    /// Returns summary-oriented parse options for large scans.
     pub const fn summary() -> Self {
         Self {
             categories: WorldParseCategories::all(),
@@ -58,6 +59,7 @@ impl WorldParseOptions {
     }
 
     #[must_use]
+    /// Returns options that retain structured parsed entries without raw values.
     pub const fn structured() -> Self {
         Self {
             categories: WorldParseCategories::all(),
@@ -68,6 +70,7 @@ impl WorldParseOptions {
     }
 
     #[must_use]
+    /// Returns options that retain structured entries, raw values, and full subchunk indices.
     pub const fn full_raw() -> Self {
         Self {
             categories: WorldParseCategories::all(),
@@ -78,6 +81,7 @@ impl WorldParseOptions {
     }
 
     #[must_use]
+    /// Returns the full raw parse options.
     pub const fn full() -> Self {
         Self::full_raw()
     }
@@ -108,6 +112,7 @@ pub struct WorldParseCategories {
 
 impl WorldParseCategories {
     #[must_use]
+    /// Enables parsing for every supported record category.
     pub const fn all() -> Self {
         Self {
             chunks: true,
@@ -120,6 +125,7 @@ impl WorldParseCategories {
     }
 
     #[must_use]
+    /// Disables value parsing so scans retain only key classification and counters.
     pub const fn keys_only() -> Self {
         Self {
             chunks: false,
@@ -145,11 +151,13 @@ pub enum RetentionMode {
 
 impl RetentionMode {
     #[must_use]
+    /// Returns whether parsed entries are retained in output.
     pub const fn retains_entries(self) -> bool {
         matches!(self, Self::Structured | Self::FullRaw)
     }
 
     #[must_use]
+    /// Returns whether raw value bytes are retained in output.
     pub const fn retains_raw(self) -> bool {
         matches!(self, Self::FullRaw)
     }
@@ -171,86 +179,149 @@ pub enum ActorResolution {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 /// Aggregate counters and non-fatal diagnostics produced by parsers.
 pub struct WorldParseReport {
+    /// Number of storage entries visited during the scan.
     pub entry_count: usize,
+    /// Number of chunks represented by these bounds.
     pub chunk_count: usize,
+    /// Number of modern subchunk records parsed.
     pub subchunk_count: usize,
+    /// Number of legacy subchunk records parsed.
     pub legacy_subchunk_count: usize,
+    /// Number of legacy terrain records parsed.
     pub legacy_terrain_count: usize,
+    /// Number of subchunk storage layers decoded.
     pub subchunk_storage_count: usize,
+    /// Number of block palette states decoded from subchunks.
     pub palette_state_count: usize,
+    /// Number of entity records parsed.
     pub entity_count: usize,
+    /// Number of block entity records parsed.
     pub block_entity_count: usize,
+    /// Number of item stacks found inside parsed NBT payloads.
     pub item_count: usize,
+    /// Number of player records parsed.
     pub player_count: usize,
+    /// Number of parsed NBT roots not classified as a known record family.
     pub other_nbt_root_count: usize,
+    /// Number of entries whose raw bytes were retained.
     pub raw_entry_count: usize,
+    /// Number of actor digest records parsed.
     pub actor_digest_count: usize,
+    /// Number of actor digest references resolved to actor records.
     pub actor_digest_hit_count: usize,
+    /// Number of actor digest references missing a matching actor record.
     pub actor_digest_missing_count: usize,
+    /// Number of biome records parsed.
     pub biome_record_count: usize,
+    /// Number of biome storage layers decoded.
     pub biome_layer_count: usize,
+    /// Number of hardcoded spawn area records parsed.
     pub hardcoded_spawn_area_count: usize,
+    /// Number of village records parsed.
     pub village_record_count: usize,
+    /// Number of map records parsed.
     pub map_record_count: usize,
+    /// Number of global records parsed.
     pub global_record_count: usize,
+    /// Counts grouped by decoded key kind.
     pub key_kinds: BTreeMap<String, usize>,
+    /// Non-fatal warnings collected while parsing.
     pub warnings: Vec<String>,
+    /// Non-fatal parse errors collected while scanning.
     pub parse_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed storage entry retained by a world parse.
 pub struct ParsedDbEntry {
+    /// Decoded storage key for this record.
     pub key: BedrockDbKey,
+    /// Original storage key bytes.
     pub raw_key: Bytes,
+    /// Length of the original storage value in bytes.
     pub raw_value_len: usize,
+    /// Parsed value or retained raw bytes for this record.
     pub value: ParsedDbValue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed chunk result and per-chunk parse report.
 pub struct ParsedChunkData {
+    /// Chunk position represented by this parsed result.
     pub pos: ChunkPos,
+    /// Records included in this result.
     pub records: Vec<ParsedChunkRecord>,
+    /// Counters and non-fatal diagnostics collected while parsing.
     pub report: WorldParseReport,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed high-level value for a classified storage entry.
 pub enum ParsedDbValue {
+    /// Chunk-scoped storage record.
     Chunk(ParsedChunkRecord),
+    /// Player record value.
     Player(ParsedPlayer),
+    /// Actor entities decoded from the value.
     ActorEntities(Vec<ParsedEntity>),
+    /// Modern actor digest record.
     ActorDigest(ParsedActorDigest),
+    /// Map record value.
     MapData(ParsedMapData),
+    /// Village record value.
     VillageData(ParsedVillageData),
+    /// Global record value.
     GlobalData(ParsedGlobalData),
+    /// Consecutive NBT roots decoded from the value.
     NbtRoots(Vec<NbtTag>),
+    /// Raw bytes preserved because the payload was not decoded.
     Raw(Bytes),
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed chunk record value paired with its decoded key.
 pub struct ParsedChunkRecord {
+    /// Decoded storage key for this record.
     pub key: crate::ChunkKey,
+    /// Parsed payload or retained raw bytes for this record.
     pub value: ParsedChunkRecordValue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed payload stored under a chunk record tag.
 pub enum ParsedChunkRecordValue {
+    /// Data sourced from decoded subchunks.
     SubChunk(SubChunk),
+    /// Old `LevelDB`-era terrain record.
     LegacyTerrain(LegacyTerrain),
+    /// Consecutive entity NBT roots decoded from a chunk entity record.
     Entities(Vec<ParsedEntity>),
+    /// Consecutive block-entity NBT roots decoded from a chunk record.
     BlockEntities(Vec<ParsedBlockEntity>),
+    /// Pending tick NBT record.
     PendingTicks(Vec<NbtTag>),
+    /// Current chunk version record.
     Version(u8),
+    /// Finalized state record.
     FinalizedState(i32),
+    /// Biome metadata record.
     BiomeData(ParsedBiomeData),
+    /// Hardcoded spawn areas decoded from chunk storage.
     HardcodedSpawnAreas(Vec<ParsedHardcodedSpawnArea>),
+    /// Raw bytes preserved because the payload was not decoded.
     Raw(Bytes),
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed modern actor digest and resolved actor payloads.
 pub struct ParsedActorDigest {
+    /// Chunk position whose digest referenced these actor ids.
     pub pos: crate::ChunkPos,
+    /// Actor ids referenced by a digest record.
     pub actor_ids: Vec<i64>,
+    /// Parsed entity records included in this value.
     pub entities: Vec<ParsedEntity>,
+    /// Number of actor ids whose actorprefix record was missing.
     pub missing_actor_count: usize,
 }
 
@@ -277,17 +348,26 @@ pub struct ActorRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed biome payload with height map and storage layers.
 pub struct ParsedBiomeData {
+    /// Bedrock format or payload version.
     pub version: ChunkVersion,
+    /// Height-map values in Bedrock `z * 16 + x` column order.
     pub height_map: Vec<i16>,
+    /// Biome or block storages decoded from the record.
     pub storages: Vec<ParsedBiomeStorage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed biome palette storage layer.
 pub struct ParsedBiomeStorage {
+    /// Vertical biome section index for 3D data, or `None` for 2D biome data.
     pub y: Option<i32>,
+    /// Palette values referenced by packed indices.
     pub palette: Vec<u32>,
+    /// Optional unpacked palette indices in Bedrock storage order.
     pub indices: Option<Vec<u16>>,
+    /// Per-palette-entry usage counts collected while decoding.
     pub counts: Vec<u16>,
 }
 
@@ -464,6 +544,7 @@ impl Biome3d {
 
 impl HardcodedSpawnAreaKind {
     #[must_use]
+    /// Returns the raw chunk record tag byte.
     pub const fn byte(self) -> u8 {
         match self {
             Self::NetherFortress => 1,
@@ -475,6 +556,7 @@ impl HardcodedSpawnAreaKind {
     }
 
     #[must_use]
+    /// Decodes a raw chunk record tag byte.
     pub const fn from_byte(value: u8) -> Self {
         match value {
             1 => Self::NetherFortress,
@@ -487,6 +569,7 @@ impl HardcodedSpawnAreaKind {
 }
 
 impl ParsedHardcodedSpawnArea {
+    /// Validates this value and returns a typed error on failure.
     pub fn validate(&self) -> WorldResult<()> {
         for axis in 0..3 {
             if self.min[axis] > self.max[axis] {
@@ -576,9 +659,13 @@ pub struct MapPixels {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed village record with decoded NBT roots.
 pub struct ParsedVillageData {
+    /// Decoded storage key for this record.
     pub key: ParsedVillageKey,
+    /// Consecutive Bedrock NBT roots decoded from the value.
     pub roots: Vec<NbtTag>,
+    /// Original raw value retained for inspection or roundtrip preservation.
     pub raw: Bytes,
 }
 
@@ -652,48 +739,80 @@ pub struct ChunkModel {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed player record with decoded NBT roots.
 pub struct ParsedPlayer {
+    /// Decoded storage key for this record.
     pub key: BedrockDbKey,
+    /// Player unique id decoded from NBT, when present.
     pub unique_id: Option<i64>,
+    /// World position `[x, y, z]` decoded from player NBT, when present.
     pub position: Option<[f64; 3]>,
+    /// Dimension id decoded from player NBT, when present.
     pub dimension_id: Option<i32>,
+    /// Item stacks decoded from this payload.
     pub items: Vec<ItemStack>,
+    /// Original or parsed Bedrock NBT payload.
     pub nbt: NbtTag,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed entity summary and NBT payload.
 pub struct ParsedEntity {
+    /// Entity identifier decoded from NBT, when present.
     pub identifier: Option<String>,
+    /// Entity definition identifiers decoded from NBT.
     pub definitions: Vec<String>,
+    /// Entity unique id decoded from NBT, when present.
     pub unique_id: Option<i64>,
+    /// World position `[x, y, z]` decoded from NBT, when present.
     pub position: Option<[f64; 3]>,
+    /// Entity rotation `[yaw, pitch]` decoded from NBT, when present.
     pub rotation: Option<[f32; 2]>,
+    /// Entity velocity `[x, y, z]` decoded from NBT, when present.
     pub motion: Option<[f32; 3]>,
+    /// Item stacks decoded from this payload.
     pub items: Vec<ItemStack>,
+    /// Original or parsed Bedrock NBT payload.
     pub nbt: NbtTag,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Parsed block entity summary and NBT payload.
 pub struct ParsedBlockEntity {
+    /// Identifier value decoded from storage or NBT.
     pub id: Option<String>,
+    /// World block position `[x, y, z]` decoded from NBT, when present.
     pub position: Option<[i32; 3]>,
+    /// Whether the block entity reports itself as movable.
     pub is_movable: Option<bool>,
+    /// Custom display name decoded from NBT, when present.
     pub custom_name: Option<String>,
+    /// Item stacks decoded from this payload.
     pub items: Vec<ItemStack>,
+    /// Original or parsed Bedrock NBT payload.
     pub nbt: NbtTag,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Item stack extracted from entity, block entity, or player NBT.
 pub struct ItemStack {
+    /// Named Bedrock value or identifier.
     pub name: Option<String>,
+    /// Stack count decoded from NBT, when present.
     pub count: Option<i32>,
+    /// Item damage value decoded from NBT, when present.
     pub damage: Option<i32>,
+    /// Whether the item stack was marked as picked up.
     pub was_picked_up: Option<bool>,
+    /// Whether this item stack contains a nested block payload.
     pub has_block: bool,
+    /// Whether this item stack contains a nested tag payload.
     pub has_tag: bool,
+    /// Original or parsed Bedrock NBT payload.
     pub nbt: NbtTag,
 }
 
+/// Parses world storage using the selected options and accumulates non-fatal diagnostics.
 pub fn parse_world_storage(
     level_dat: LevelDatDocument,
     storage: &dyn WorldStorage,
@@ -738,11 +857,13 @@ pub fn parse_world_storage(
 }
 
 #[must_use]
+/// Parse chunk records.
 pub fn parse_chunk_records(pos: ChunkPos, records: Vec<ChunkRecord>) -> ParsedChunkData {
     parse_chunk_records_with_options(pos, records, WorldParseOptions::full())
 }
 
 #[must_use]
+/// Parse chunk records with options.
 pub fn parse_chunk_records_with_options(
     pos: ChunkPos,
     records: Vec<ChunkRecord>,
@@ -771,6 +892,7 @@ pub fn parse_chunk_records_with_options(
     }
 }
 
+/// Parse global storage entries.
 pub fn parse_global_storage_entries(
     storage: &dyn WorldStorage,
     options: WorldParseOptions,
@@ -1119,6 +1241,7 @@ fn parse_global_value(name: &str, value: &Bytes, report: &mut WorldParseReport) 
     }
 }
 
+/// Parse map record.
 pub fn parse_map_record(id: MapRecordId, value: Bytes) -> WorldResult<ParsedMapData> {
     let roots = parse_consecutive_root_nbt(&value)?;
     Ok(ParsedMapData {
@@ -1131,10 +1254,12 @@ pub fn parse_map_record(id: MapRecordId, value: Bytes) -> WorldResult<ParsedMapD
     })
 }
 
+/// Encode map record.
 pub fn encode_map_record(record: &ParsedMapData) -> WorldResult<Bytes> {
     encode_consecutive_roots(&record.roots)
 }
 
+/// Parse global record.
 pub fn parse_global_record(
     kind: GlobalRecordKind,
     name: String,
@@ -1149,10 +1274,12 @@ pub fn parse_global_record(
     })
 }
 
+/// Encode global record.
 pub fn encode_global_record(record: &ParsedGlobalData) -> WorldResult<Bytes> {
     encode_consecutive_roots(&record.roots)
 }
 
+/// Parse actor digest ids.
 pub fn parse_actor_digest_ids(value: &[u8]) -> WorldResult<Vec<ActorUid>> {
     if !value.len().is_multiple_of(8) {
         return Err(BedrockWorldError::CorruptWorld(format!(
@@ -1169,6 +1296,7 @@ pub fn parse_actor_digest_ids(value: &[u8]) -> WorldResult<Vec<ActorUid>> {
     Ok(actor_ids)
 }
 
+/// Encode actor digest ids.
 pub fn encode_actor_digest_ids(actor_ids: &[ActorUid]) -> Bytes {
     let mut bytes = Vec::with_capacity(actor_ids.len() * 8);
     for actor_id in actor_ids {
@@ -1177,12 +1305,14 @@ pub fn encode_actor_digest_ids(actor_ids: &[ActorUid]) -> Bytes {
     Bytes::from(bytes)
 }
 
+/// Parse hardcoded spawn area records.
 pub fn parse_hardcoded_spawn_area_records(
     value: &[u8],
 ) -> WorldResult<Vec<ParsedHardcodedSpawnArea>> {
     read_hardcoded_spawn_areas(value).map_err(BedrockWorldError::Validation)
 }
 
+/// Encode hardcoded spawn area records.
 pub fn encode_hardcoded_spawn_area_records(
     areas: &[ParsedHardcodedSpawnArea],
 ) -> WorldResult<Bytes> {
@@ -1203,6 +1333,7 @@ pub fn encode_hardcoded_spawn_area_records(
     Ok(Bytes::from(bytes))
 }
 
+/// Encode consecutive roots.
 pub fn encode_consecutive_roots(roots: &[NbtTag]) -> WorldResult<Bytes> {
     if roots.is_empty() {
         return Err(BedrockWorldError::Validation(

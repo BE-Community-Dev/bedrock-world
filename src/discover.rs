@@ -23,6 +23,7 @@ pub struct WorldDiscovery {
 
 impl WorldDiscovery {
     #[must_use]
+    /// Creates discovery options for the given root directories.
     pub fn new(roots: Vec<PathBuf>) -> Self {
         Self {
             roots,

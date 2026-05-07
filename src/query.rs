@@ -26,14 +26,20 @@ const WRITE_CONFIRM_TOKEN: &str = "CONFIRMED";
 /// Inclusive chunk bounds used by professional map queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlimeChunkBounds {
+    /// Bedrock dimension queried by these bounds.
     pub dimension: Dimension,
+    /// Inclusive minimum chunk X coordinate.
     pub min_chunk_x: i32,
+    /// Inclusive maximum chunk X coordinate.
     pub max_chunk_x: i32,
+    /// Inclusive minimum chunk Z coordinate.
     pub min_chunk_z: i32,
+    /// Inclusive maximum chunk Z coordinate.
     pub max_chunk_z: i32,
 }
 
 impl SlimeChunkBounds {
+    /// Validates this value and returns a typed error on failure.
     pub fn validate(self) -> Result<()> {
         if self.min_chunk_x > self.max_chunk_x || self.min_chunk_z > self.max_chunk_z {
             return Err(BedrockWorldError::Validation(format!(
@@ -45,6 +51,7 @@ impl SlimeChunkBounds {
     }
 
     #[must_use]
+    /// Returns the number of chunks covered by these inclusive bounds.
     pub const fn chunk_count(self) -> usize {
         let width = self.max_chunk_x.saturating_sub(self.min_chunk_x) as usize + 1;
         let height = self.max_chunk_z.saturating_sub(self.min_chunk_z) as usize + 1;
@@ -52,6 +59,7 @@ impl SlimeChunkBounds {
     }
 
     #[must_use]
+    /// Converts generic chunk bounds into slime-query bounds.
     pub fn from_chunk_bounds(bounds: ChunkBounds) -> Self {
         Self {
             dimension: bounds.dimension,
@@ -63,6 +71,7 @@ impl SlimeChunkBounds {
     }
 
     #[must_use]
+    /// Returns the midpoint chunk X/Z coordinates for these inclusive bounds.
     pub const fn center(self) -> (i32, i32) {
         (
             i32::midpoint(self.min_chunk_x, self.max_chunk_x),
@@ -88,6 +97,7 @@ impl From<RenderChunkRegion> for SlimeChunkBounds {
 pub struct SlimeWindowSize(u8);
 
 impl SlimeWindowSize {
+    /// Creates a new value.
     pub fn new(size: u8) -> Result<Self> {
         if size == 0 || size.is_multiple_of(2) {
             return Err(BedrockWorldError::Validation(format!(
@@ -98,6 +108,7 @@ impl SlimeWindowSize {
     }
 
     #[must_use]
+    /// Returns the value at the requested coordinates.
     pub const fn get(self) -> u8 {
         self.0
     }
@@ -106,85 +117,122 @@ impl SlimeWindowSize {
 /// Ranked slime chunk window candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlimeChunkWindow {
+    /// Center chunk for this candidate window.
     pub center: ChunkPos,
+    /// Inclusive minimum chunk X coordinate.
     pub min_chunk_x: i32,
+    /// Inclusive maximum chunk X coordinate.
     pub max_chunk_x: i32,
+    /// Inclusive minimum chunk Z coordinate.
     pub min_chunk_z: i32,
+    /// Inclusive maximum chunk Z coordinate.
     pub max_chunk_z: i32,
+    /// Number of slime chunks inside the window.
     pub slime_count: usize,
+    /// Total number of chunks inside the window.
     pub total_count: usize,
 }
 
 /// One raw chunk record exposed through the query API.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkRecordDetail {
+    /// Bedrock chunk record tag for this value.
     pub tag: ChunkRecordTag,
+    /// Length of the original storage value in bytes.
     pub raw_value_len: usize,
+    /// Consecutive Bedrock NBT roots decoded from the value.
     pub roots: Vec<NbtTag>,
+    /// Whether the record can be written back as NBT by this API.
     pub writable_nbt: bool,
 }
 
 /// Detailed query result for one chunk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkDetail {
+    /// Chunk position queried for this detail result.
     pub pos: ChunkPos,
+    /// Records included in this result.
     pub records: Vec<ChunkRecordDetail>,
 }
 
 /// Block/tip information for one map coordinate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockTip {
+    /// World block position for the queried map coordinate.
     pub block: BlockPos,
+    /// Chunk containing the queried block.
     pub chunk: ChunkPos,
+    /// Local X coordinate within the chunk, in the range 0..16.
     pub local_x: u8,
+    /// Local Z coordinate within the chunk, in the range 0..16.
     pub local_z: u8,
+    /// Surface-column sample for the queried block, when available.
     pub surface: Option<SurfaceColumn>,
+    /// Biome id associated with the sampled column.
     pub biome_id: Option<u32>,
+    /// Height in pixels or blocks, depending on the surrounding type.
     pub height: Option<i16>,
+    /// Whether the chunk is a Bedrock slime chunk.
     pub is_slime_chunk: bool,
 }
 
 /// Entity marker shown by map overlays.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityOverlay {
+    /// Entity identifier decoded from NBT, when present.
     pub identifier: Option<String>,
+    /// World position `[x, y, z]` decoded from the entity record.
     pub position: [f64; 3],
+    /// Chunk containing the entity position.
     pub chunk: ChunkPos,
+    /// Original or parsed Bedrock NBT payload.
     pub nbt: NbtTag,
 }
 
 /// Block entity marker shown by map overlays.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockEntityOverlay {
+    /// Identifier value decoded from storage or NBT.
     pub id: Option<String>,
+    /// World block position `[x, y, z]` decoded from the block entity.
     pub position: [i32; 3],
+    /// Chunk containing the block entity position.
     pub chunk: ChunkPos,
+    /// Original or parsed Bedrock NBT payload.
     pub nbt: NbtTag,
 }
 
 /// Hardcoded spawn area overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardcodedSpawnAreaOverlay {
+    /// Parsed hardcoded spawn area.
     pub area: ParsedHardcodedSpawnArea,
+    /// Chunk containing the hardcoded spawn area anchor.
     pub chunk: ChunkPos,
 }
 
 /// Village overlay. Bounds are best-effort because village NBT shapes vary by version.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VillageOverlay {
+    /// Decoded storage key for this record.
     pub key: crate::ParsedVillageKey,
+    /// Inclusive chunk bounds for this value.
     pub bounds: Option<SlimeChunkBounds>,
+    /// Number of NBT roots decoded from the value.
     pub root_count: usize,
+    /// Length of the original raw value in bytes.
     pub raw_len: usize,
 }
 
 /// Reusable village overlay index for map viewers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VillageOverlayIndex {
+    /// Whether village records are included.
     pub villages: Vec<VillageOverlay>,
 }
 
 impl VillageOverlayIndex {
+    /// Builds a reusable village overlay index on the calling thread.
     pub fn build_blocking_with_control<S>(
         world: &BedrockWorld<S>,
         cancel: &CancelFlag,
@@ -202,6 +250,7 @@ impl VillageOverlayIndex {
     }
 
     #[must_use]
+    /// Returns village overlays intersecting the requested bounds, capped by `max_items`.
     pub fn query(&self, bounds: SlimeChunkBounds, max_items: usize) -> Vec<VillageOverlay> {
         self.villages
             .iter()
@@ -219,25 +268,40 @@ impl VillageOverlayIndex {
 /// Overlay query result for a map region.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegionOverlayQuery {
+    /// Inclusive chunk bounds for this value.
     pub bounds: SlimeChunkBounds,
+    /// Slime chunk positions in the queried region.
     pub slime_chunks: Vec<ChunkPos>,
+    /// Hardcoded spawn area overlays in the queried region.
     pub hardcoded_spawn_areas: Vec<HardcodedSpawnAreaOverlay>,
+    /// Parsed entity records included in this value.
     pub entities: Vec<EntityOverlay>,
+    /// Whether block-entity records are loaded with render data.
     pub block_entities: Vec<BlockEntityOverlay>,
+    /// Whether village records are included.
     pub villages: Vec<VillageOverlay>,
+    /// Number of chunks scanned for this query.
     pub scanned_chunks: usize,
+    /// Number of expected chunks missing from storage.
     pub missing_chunks: usize,
 }
 
 /// Query options with hard limits for interactive map use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionOverlayQueryOptions {
+    /// Whether slime chunk overlays are included.
     pub include_slime: bool,
+    /// Whether hardcoded spawn areas are included.
     pub include_hardcoded_spawn_areas: bool,
+    /// Whether entity overlays are included.
     pub include_entities: bool,
+    /// Whether block-entity overlays are included.
     pub include_block_entities: bool,
+    /// Whether village overlays are included.
     pub include_villages: bool,
+    /// Maximum chunks accepted for this query.
     pub max_chunks: usize,
+    /// Maximum overlay items returned for each item kind.
     pub max_items_per_kind: usize,
 }
 
@@ -258,14 +322,23 @@ impl Default for RegionOverlayQueryOptions {
 /// Aggregate statistics for a selected chunk area.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SelectionStats {
+    /// Inclusive chunk bounds for this value.
     pub bounds: Option<SlimeChunkBounds>,
+    /// Number of chunks represented by these bounds.
     pub chunk_count: usize,
+    /// Number of chunks with renderable data loaded.
     pub loaded_chunks: usize,
+    /// Number of expected chunks missing from storage.
     pub missing_chunks: usize,
+    /// Slime chunk positions in the queried region.
     pub slime_chunks: usize,
+    /// Number of entity overlays found in the selection.
     pub entity_count: usize,
+    /// Number of block entity overlays found in the selection.
     pub block_entity_count: usize,
+    /// Number of hardcoded spawn area overlays found in the selection.
     pub hardcoded_spawn_area_count: usize,
+    /// Number of village overlays found in the selection.
     pub village_count: usize,
 }
 
@@ -279,6 +352,7 @@ pub struct WriteGuard {
 
 impl WriteGuard {
     #[must_use]
+    /// Creates a confirmed write guard for a specific world path and operation.
     pub fn confirmed(world_path: impl Into<PathBuf>, operation: impl Into<String>) -> Self {
         Self {
             world_path: world_path.into(),
@@ -308,16 +382,19 @@ impl WriteGuard {
 }
 
 #[must_use]
+/// Is bedrock slime chunk.
 pub fn is_bedrock_slime_chunk(chunk_x: i32, chunk_z: i32) -> bool {
     let seed = (chunk_x as u32).wrapping_mul(0x1f1f_1f1f) ^ (chunk_z as u32);
     mt19937_first_u32(seed).is_multiple_of(10)
 }
 
 #[must_use]
+/// Is slime chunk.
 pub fn is_slime_chunk(pos: ChunkPos) -> bool {
     pos.dimension == Dimension::Overworld && is_bedrock_slime_chunk(pos.x, pos.z)
 }
 
+/// Query slime chunk windows.
 pub fn query_slime_chunk_windows(
     bounds: SlimeChunkBounds,
     window_size: SlimeWindowSize,
@@ -391,6 +468,7 @@ pub fn query_slime_chunk_windows(
     Ok(windows)
 }
 
+/// Query block tip blocking.
 pub fn query_block_tip_blocking<S>(
     world: &BedrockWorld<S>,
     block: BlockPos,
@@ -422,6 +500,7 @@ where
     })
 }
 
+/// Query chunk detail blocking.
 pub fn query_chunk_detail_blocking<S>(world: &BedrockWorld<S>, pos: ChunkPos) -> Result<ChunkDetail>
 where
     S: WorldStorageHandle,
@@ -440,6 +519,7 @@ where
     Ok(ChunkDetail { pos, records })
 }
 
+/// Query region overlays blocking.
 pub fn query_region_overlays_blocking<S>(
     world: &BedrockWorld<S>,
     bounds: SlimeChunkBounds,
@@ -451,6 +531,7 @@ where
     query_region_overlays_blocking_inner(world, bounds, options, None)
 }
 
+/// Query region overlays blocking with control.
 pub fn query_region_overlays_blocking_with_control<S>(
     world: &BedrockWorld<S>,
     bounds: SlimeChunkBounds,
@@ -594,6 +675,7 @@ fn check_query_cancelled(cancel: Option<&CancelFlag>) -> Result<()> {
     Ok(())
 }
 
+/// Query selection stats blocking.
 pub fn query_selection_stats_blocking<S>(
     world: &BedrockWorld<S>,
     bounds: SlimeChunkBounds,
@@ -616,6 +698,7 @@ where
     })
 }
 
+/// Delete chunks blocking.
 pub fn delete_chunks_blocking<S>(
     world: &BedrockWorld<S>,
     bounds: SlimeChunkBounds,
@@ -645,6 +728,7 @@ where
     Ok(deleted)
 }
 
+/// Write chunk record nbt blocking.
 pub fn write_chunk_record_nbt_blocking<S>(
     world: &BedrockWorld<S>,
     pos: ChunkPos,

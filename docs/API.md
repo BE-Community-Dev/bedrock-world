@@ -22,9 +22,11 @@ bytes by parsing them back before replacing the file.
 
 `BedrockWorld::open(path, OpenOptions::default())` opens a world in read-only
 mode and auto-detects `db/CURRENT` LevelDB worlds or old Pocket Edition
-`chunks.dat` worlds. `BedrockWorld::open_blocking` exposes the same detection
-for CLI tools and examples. Use targeted APIs instead of full-world parsing for
-UI flows:
+`chunks.dat` worlds. Open with `OpenOptions { read_only: false, ..Default::default() }`
+only for explicit edit flows; high-level writes call `ensure_writable` and
+return `BedrockWorldErrorKind::ReadOnly` on read-only handles before any storage
+mutation. `BedrockWorld::open_blocking` exposes the same detection for CLI tools
+and examples. Use targeted APIs instead of full-world parsing for UI flows:
 
 - `list_players_blocking`
 - `classify_keys_blocking`
@@ -154,7 +156,10 @@ old 82,176-byte `chunks.dat` terrain payload to an 83,200-byte virtual
 v0.2 adds typed APIs for BedrockLevelFormat records that map editors usually
 need without forcing a full-world parse. The storage boundary remains raw
 key/value: `bedrock-world` owns Bedrock key classification, NBT codecs,
-coordinate validation, and write roundtrip checks.
+coordinate validation, and write roundtrip checks. This crate does not decide
+how callers refresh or invalidate their presentation state after a write;
+downstream applications and adapter crates map these semantic writes to their
+own update model.
 
 Key helpers:
 
@@ -195,7 +200,17 @@ Chunk payload helpers:
 All high-level writes validate the serialized value by parsing it back before
 committing. Actor writes update `actorprefix` and `digp` in one transaction.
 Block-entity writes reject coordinates outside the target chunk. `chunks.dat`
-backends stay read-only.
+backends stay read-only. Write examples should therefore open a writable world:
+
+```rust
+let world = bedrock_world::BedrockWorld::open_blocking(
+    "world",
+    bedrock_world::OpenOptions {
+        read_only: false,
+        ..bedrock_world::OpenOptions::default()
+    },
+)?;
+```
 
 ## Parsing Modes
 

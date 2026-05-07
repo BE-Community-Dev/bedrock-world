@@ -6,6 +6,11 @@ All notable changes to `bedrock-world` are tracked here.
 
 ### Changed
 
+- Added docs.rs all-features metadata, crate-level feature guidance, and
+  README sections describing hosted docs, feature behavior, and package
+  contents.
+- Added complete public API rustdoc coverage and enabled the release workflow's
+  missing-docs gate for all-feature rustdoc builds.
 - Prepared the crate for publishing by removing `publish = false` and declaring
   the optional `bedrock-leveldb` backend as a versioned `0.2.1` dependency while
   retaining the local `../bedrock-leveldb` path for repository development.

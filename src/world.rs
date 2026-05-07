@@ -65,18 +65,26 @@ impl Default for OpenOptions {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Preferred storage format selection used when opening a world.
 pub enum WorldFormatHint {
     #[default]
+    /// Automatically choose the appropriate mode.
     Auto,
+    /// Modern Bedrock `LevelDB` world.
     LevelDb,
+    /// Pre-`LevelDB` Pocket Edition `chunks.dat` world.
     PocketChunksDat,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Detected world storage format.
 pub enum WorldFormat {
     #[default]
+    /// Modern Bedrock `LevelDB` world.
     LevelDb,
+    /// Old `LevelDB` world using `LegacyTerrain` records.
     LevelDbLegacyTerrain,
+    /// Pre-`LevelDB` Pocket Edition `chunks.dat` world.
     PocketChunksDat,
 }
 
@@ -93,6 +101,7 @@ pub struct BedrockWorld<S = Arc<dyn WorldStorage>> {
 
 /// Storage handle accepted by generic [`BedrockWorld`] methods.
 pub trait WorldStorageHandle: Clone + Send + Sync + 'static {
+    /// Returns the raw storage backend behind this handle.
     fn storage(&self) -> &dyn WorldStorage;
 }
 
@@ -121,8 +130,11 @@ impl WorldStorageHandle for Arc<dyn WorldStorage> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Options for surface-column lookup.
 pub struct SurfaceColumnOptions {
+    /// Whether air blocks are skipped when finding a surface column.
     pub skip_air: bool,
+    /// Whether water is treated as transparent context over terrain.
     pub transparent_water: bool,
 }
 
@@ -136,31 +148,47 @@ impl Default for SurfaceColumnOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Legacy surface-column query result.
 pub struct SurfaceColumn {
+    /// World Y coordinate selected as the visible surface.
     pub y: i32,
+    /// Block name selected for this result.
     pub block_name: String,
+    /// Biome id associated with the sampled column.
     pub biome_id: Option<u32>,
+    /// Number of water blocks above the underwater support block.
     pub water_depth: u8,
+    /// Block name below water, when found.
     pub under_water_block_name: Option<String>,
+    /// Whether the value came from a fallback path.
     pub is_fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Controls how much subchunk data exact surface loading reads.
 pub enum ExactSurfaceSubchunkPolicy {
+    /// Load the full subchunk range required by the request.
     Full,
+    /// Use height hints first and reload when verification requires it.
     HintThenVerify,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Bounded pipeline settings for world scans and render loads.
 pub struct WorldPipelineOptions {
+    /// Maximum queued work items; zero selects an automatic default.
     pub queue_depth: usize,
+    /// Chunk batch size; zero selects an automatic default.
     pub chunk_batch_size: usize,
+    /// Subchunk decode worker count; zero selects an automatic default.
     pub subchunk_decode_workers: usize,
+    /// Progress callback interval; zero selects an automatic default.
     pub progress_interval: usize,
 }
 
 impl WorldPipelineOptions {
     #[must_use]
+    /// Resolves the effective bounded queue depth.
     pub fn resolve_queue_depth(self, workers: usize, work_items: usize) -> usize {
         self.queue_depth
             .max(if self.queue_depth == 0 {
@@ -175,6 +203,7 @@ impl WorldPipelineOptions {
     }
 
     #[must_use]
+    /// Resolves the effective progress callback interval.
     pub fn resolve_progress_interval(self) -> usize {
         self.progress_interval
             .max(if self.progress_interval == 0 { 256 } else { 1 })
@@ -182,36 +211,56 @@ impl WorldPipelineOptions {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Ordering policy for render chunk loading.
 pub enum RenderChunkPriority {
     #[default]
+    /// Process chunks in row-major order.
     RowMajor,
+    /// Prioritize chunks by distance from a center chunk.
     DistanceFrom {
+        /// Center chunk X coordinate used for distance sorting.
         chunk_x: i32,
+        /// Center chunk Z coordinate used for distance sorting.
         chunk_z: i32,
     },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Biome loading policy for exact surface requests.
 pub enum ExactSurfaceBiomeLoad {
+    /// No optional data is requested or available.
     None,
     #[default]
+    /// Load biome data needed for top-column sampling.
     TopColumns,
+    /// Load all matching biome data.
     All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Render chunk data contract requested by the caller.
 pub enum RenderChunkRequest {
+    /// Load blocks and compute exact surface columns.
     ExactSurface {
+        /// Exact-surface subchunk loading policy.
         subchunks: ExactSurfaceSubchunkPolicy,
+        /// Biome loading policy for the render request.
         biome: ExactSurfaceBiomeLoad,
+        /// Whether block-entity records are loaded with render data.
         block_entities: bool,
     },
+    /// Load raw heightmap data for diagnostics.
     RawHeightMap,
+    /// Load a fixed Y layer.
     Layer {
+        /// World Y coordinate of the layer to sample.
         y: i32,
     },
+    /// Load biome data for a fixed Y layer.
     Biome {
+        /// World Y coordinate used to choose biome storage.
         y: i32,
+        /// Whether all matching biome data is loaded.
         load_all: bool,
     },
 }
@@ -227,62 +276,96 @@ impl Default for RenderChunkRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Source payload used for a terrain column sample.
 pub enum TerrainSampleSource {
+    /// Data sourced from decoded subchunks.
     Subchunk,
+    /// Old `LevelDB`-era terrain record.
     LegacyTerrain,
+    /// Data sourced from legacy terrain as a fallback.
     LegacyFallback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Biome value associated with a terrain column.
 pub enum TerrainColumnBiome {
+    /// Numeric biome id value.
     Id(u32),
+    /// Legacy biome sample value.
     Legacy(LegacyBiomeSample),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Role assigned to a block during surface sampling.
 pub enum TerrainSurfaceRole {
+    /// Air terrain role.
     Air,
+    /// Water terrain role.
     Water,
+    /// Thin overlay terrain role.
     Overlay,
+    /// Primary solid terrain role.
     Primary,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Thin overlay block above a sampled surface.
 pub struct TerrainColumnOverlay {
+    /// World Y coordinate of the overlay block.
     pub y: i16,
+    /// Block state selected as the overlay.
     pub block_state: BlockState,
+    /// Storage or terrain source that produced this value.
     pub source: TerrainSampleSource,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Water context for a sampled surface column.
 pub struct TerrainColumnWater {
+    /// Y coordinate of the visible surface block.
     pub surface_y: i16,
+    /// Water block state at the visible surface.
     pub block_state: BlockState,
+    /// Depth in blocks.
     pub depth: u8,
+    /// Y coordinate of the first underwater support block, when found.
     pub underwater_y: Option<i16>,
+    /// Block state below water, when found.
     pub underwater_block_state: Option<BlockState>,
+    /// Storage or terrain source that produced this value.
     pub source: TerrainSampleSource,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Canonical terrain surface sample for one local X/Z column.
 pub struct TerrainColumnSample {
+    /// Y coordinate of the visible surface block.
     pub surface_y: i16,
+    /// Block state selected as the visible surface.
     pub surface_block_state: BlockState,
+    /// Y coordinate of the supporting relief block.
     pub relief_y: i16,
+    /// Block state selected as relief/support.
     pub relief_block_state: BlockState,
+    /// Optional thin overlay block above the primary surface.
     pub overlay: Option<TerrainColumnOverlay>,
+    /// Optional water context for this sampled column.
     pub water: Option<TerrainColumnWater>,
+    /// Biome loading policy for the render request.
     pub biome: Option<TerrainColumnBiome>,
+    /// Storage or terrain source that produced this value.
     pub source: TerrainSampleSource,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Fixed 16x16 terrain column sample grid.
 pub struct TerrainColumnSamples {
     columns: Vec<Option<TerrainColumnSample>>,
 }
 
 impl TerrainColumnSamples {
     #[must_use]
+    /// Creates a new value.
     pub fn new() -> Self {
         Self {
             columns: vec![None; 16 * 16],
@@ -290,12 +373,14 @@ impl TerrainColumnSamples {
     }
 
     #[must_use]
+    /// Returns the value at the requested coordinates.
     pub fn get(&self, local_x: u8, local_z: u8) -> Option<&TerrainColumnSample> {
         self.columns
             .get(column_index(local_x, local_z)?)
             .and_then(Option::as_ref)
     }
 
+    /// Stores a value at the requested coordinates.
     pub fn set(&mut self, local_x: u8, local_z: u8, sample: TerrainColumnSample) {
         if let Some(index) = column_index(local_x, local_z)
             && let Some(slot) = self.columns.get_mut(index)
@@ -305,6 +390,7 @@ impl TerrainColumnSamples {
     }
 
     #[must_use]
+    /// Returns the number of populated sampled columns.
     pub fn sampled_columns(&self) -> usize {
         self.columns
             .iter()
@@ -312,6 +398,7 @@ impl TerrainColumnSamples {
             .count()
     }
 
+    /// Iterates over populated values.
     pub fn iter(&self) -> impl Iterator<Item = &TerrainColumnSample> {
         self.columns.iter().filter_map(Option::as_ref)
     }
@@ -324,47 +411,86 @@ impl Default for TerrainColumnSamples {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Diagnostics collected while loading render chunks.
 pub struct RenderLoadStats {
+    /// Number of chunks requested by the caller.
     pub requested_chunks: usize,
+    /// Number of chunks with renderable data loaded.
     pub loaded_chunks: usize,
+    /// Number of subchunks decoded while loading.
     pub subchunks_decoded: usize,
+    /// Number of worker threads used by the operation.
     pub worker_threads: usize,
+    /// Milliseconds spent waiting for bounded pipeline capacity.
     pub queue_wait_ms: u128,
+    /// Total chunk load time in milliseconds.
     pub load_ms: u128,
+    /// Number of exact storage keys requested.
     pub keys_requested: usize,
+    /// Number of requested storage keys found.
     pub keys_found: usize,
+    /// Number of exact batch-get operations issued.
     pub exact_get_batches: usize,
+    /// Number of prefix scans issued as fallback or discovery work.
     pub prefix_scans: usize,
+    /// Milliseconds spent decoding loaded records.
     pub decode_ms: u128,
+    /// Milliseconds spent reading from the storage backend.
     pub db_read_ms: u128,
+    /// Milliseconds spent parsing biome records.
     pub biome_parse_ms: u128,
+    /// Milliseconds spent parsing subchunk records.
     pub subchunk_parse_ms: u128,
+    /// Milliseconds spent computing surface columns.
     pub surface_scan_ms: u128,
+    /// Milliseconds spent parsing block-entity records.
     pub block_entity_parse_ms: u128,
+    /// Milliseconds spent on full reloads for exact surface requests.
     pub full_reload_ms: u128,
+    /// Number of legacy terrain records loaded.
     pub legacy_terrain_records: usize,
+    /// Number of legacy biome samples decoded.
     pub legacy_biome_samples: usize,
+    /// Compatibility RGB values decoded from legacy biome samples.
     pub legacy_biome_colors: usize,
+    /// Number of sampled columns sourced from legacy terrain.
     pub terrain_source_legacy: usize,
+    /// Number of sampled columns sourced from subchunks.
     pub terrain_source_subchunk: usize,
+    /// Number of virtual legacy chunks loaded from `chunks.dat`.
     pub legacy_pocket_chunks: usize,
+    /// World format detected during the load.
     pub detected_format: WorldFormat,
+    /// Number of surface columns computed from block data.
     pub computed_surface_columns: usize,
+    /// Columns whose raw heightmap disagreed with computed surface data.
     pub raw_height_mismatch_columns: usize,
+    /// Columns missing required subchunk data.
     pub missing_subchunk_columns: usize,
+    /// Columns that fell back to legacy terrain data.
     pub legacy_fallback_columns: usize,
+    /// Columns where legacy RGB biome samples took precedence.
     pub legacy_biome_preferred_columns: usize,
+    /// Columns where modern biome ids were used as fallback.
     pub modern_biome_fallback_columns: usize,
 }
 
 #[derive(Debug, Clone)]
+/// Options controlling render chunk loading.
 pub struct RenderChunkLoadOptions {
+    /// Render data contract requested by the caller.
     pub request: RenderChunkRequest,
+    /// Subchunk decode mode used while loading render data.
     pub subchunk_decode: SubChunkDecodeMode,
+    /// Threading policy for this operation.
     pub threading: WorldThreadingOptions,
+    /// Bounded pipeline settings for this operation.
     pub pipeline: WorldPipelineOptions,
+    /// Optional cancellation flag checked during long-running work.
     pub cancel: Option<CancelFlag>,
+    /// Optional progress sink invoked during long-running work.
     pub progress: Option<ProgressSink>,
+    /// Ordering policy for chunk loading.
     pub priority: RenderChunkPriority,
 }
 
@@ -383,29 +509,46 @@ impl Default for RenderChunkLoadOptions {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Block entity included with render chunk data.
 pub struct RenderBlockEntity {
+    /// Identifier value decoded from storage or NBT.
     pub id: Option<String>,
+    /// World block position `[x, y, z]` decoded from NBT, when present.
     pub position: Option<[i32; 3]>,
+    /// Original or parsed Bedrock NBT payload.
     pub nbt: NbtTag,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Loaded render-oriented chunk data.
 pub struct RenderChunkData {
+    /// Chunk position represented by this render data.
     pub pos: ChunkPos,
+    /// Whether enough records were found to treat the chunk as loaded.
     pub is_loaded: bool,
+    /// Height-map values in Bedrock `z * 16 + x` column order.
     pub height_map: Option<[[Option<i16>; 16]; 16]>,
+    /// Legacy biome samples decoded from old terrain records.
     pub legacy_biomes: Option<[[Option<LegacyBiomeSample>; 16]; 16]>,
+    /// Compatibility RGB values decoded from legacy biome samples.
     pub legacy_biome_colors: Option<[[Option<u32>; 16]; 16]>,
+    /// Parsed biome storage records keyed by vertical section.
     pub biome_data: BTreeMap<i32, ParsedBiomeStorage>,
+    /// Exact-surface subchunk loading policy.
     pub subchunks: BTreeMap<i8, SubChunk>,
+    /// Whether block-entity records are loaded with render data.
     pub block_entities: Vec<RenderBlockEntity>,
+    /// `LegacyTerrain` record when present for old `LevelDB` worlds.
     pub legacy_terrain: Option<LegacyTerrain>,
+    /// Canonical surface-column samples computed from actual block data.
     pub column_samples: Option<TerrainColumnSamples>,
+    /// Bedrock format or payload version.
     pub version: crate::ChunkVersion,
 }
 
 impl RenderChunkData {
     #[must_use]
+    /// Returns the sampled terrain column at local chunk coordinates.
     pub fn column_sample_at(&self, local_x: u8, local_z: u8) -> Option<&TerrainColumnSample> {
         self.column_samples.as_ref()?.get(local_x, local_z)
     }
@@ -459,13 +602,21 @@ struct RenderRecordRequest {
 }
 
 #[derive(Debug, Clone)]
+/// Options controlling render region loading.
 pub struct RenderRegionLoadOptions {
+    /// Render data contract requested by the caller.
     pub request: RenderChunkRequest,
+    /// Subchunk decode mode used while loading render data.
     pub subchunk_decode: SubChunkDecodeMode,
+    /// Threading policy for this operation.
     pub threading: WorldThreadingOptions,
+    /// Bounded pipeline settings for this operation.
     pub pipeline: WorldPipelineOptions,
+    /// Optional cancellation flag checked during long-running work.
     pub cancel: Option<CancelFlag>,
+    /// Optional progress sink invoked during long-running work.
     pub progress: Option<ProgressSink>,
+    /// Ordering policy for chunk loading.
     pub priority: RenderChunkPriority,
 }
 
@@ -498,28 +649,45 @@ impl From<RenderRegionLoadOptions> for RenderChunkLoadOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Inclusive chunk rectangle to load or scan for rendering.
 pub struct RenderChunkRegion {
+    /// Bedrock dimension covered by this region.
     pub dimension: crate::Dimension,
+    /// Inclusive minimum chunk X coordinate.
     pub min_chunk_x: i32,
+    /// Inclusive minimum chunk Z coordinate.
     pub min_chunk_z: i32,
+    /// Inclusive maximum chunk X coordinate.
     pub max_chunk_x: i32,
+    /// Inclusive maximum chunk Z coordinate.
     pub max_chunk_z: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Loaded render region and load diagnostics.
 pub struct RenderRegionData {
+    /// Inclusive chunk region requested by the load.
     pub region: RenderChunkRegion,
+    /// Parsed or loaded chunks in this result.
     pub chunks: Vec<RenderChunkData>,
+    /// Load diagnostics and timing counters.
     pub stats: RenderLoadStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Inclusive chunk bounds discovered in a world.
 pub struct ChunkBounds {
+    /// Bedrock dimension covered by these bounds.
     pub dimension: crate::Dimension,
+    /// Inclusive minimum chunk X coordinate.
     pub min_chunk_x: i32,
+    /// Inclusive minimum chunk Z coordinate.
     pub min_chunk_z: i32,
+    /// Inclusive maximum chunk X coordinate.
     pub max_chunk_x: i32,
+    /// Inclusive maximum chunk Z coordinate.
     pub max_chunk_z: i32,
+    /// Number of chunks represented by these bounds.
     pub chunk_count: usize,
 }
 
@@ -545,10 +713,15 @@ impl ChunkBounds {
 }
 
 #[derive(Debug, Clone)]
+/// Options controlling world scan operations.
 pub struct WorldScanOptions {
+    /// Threading policy for this operation.
     pub threading: WorldThreadingOptions,
+    /// Bounded pipeline settings for this operation.
     pub pipeline: WorldPipelineOptions,
+    /// Optional cancellation flag checked during long-running work.
     pub cancel: Option<CancelFlag>,
+    /// Optional progress sink invoked during long-running work.
     pub progress: Option<ProgressSink>,
 }
 
@@ -564,22 +737,29 @@ impl Default for WorldScanOptions {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Threading policy for world-level operations.
 pub enum WorldThreadingOptions {
     #[default]
+    /// Automatically choose the appropriate mode.
     Auto,
+    /// Use a fixed worker count.
     Fixed(usize),
+    /// Use a single worker.
     Single,
 }
 
+/// max world threads constant.
 pub const MAX_WORLD_THREADS: usize = 512;
 
 impl WorldThreadingOptions {
     #[must_use]
+    /// Resolves this policy to an effective worker count.
     pub fn resolve(self, work_items: usize) -> usize {
         self.resolve_unchecked(work_items)
     }
 
     #[must_use]
+    /// Resolves this policy without reporting validation errors.
     pub fn resolve_unchecked(self, work_items: usize) -> usize {
         match self {
             Self::Single => 1,
@@ -591,6 +771,7 @@ impl WorldThreadingOptions {
         }
     }
 
+    /// Resolves this policy and validates explicit worker counts.
     pub fn resolve_checked(self, work_items: usize) -> Result<usize> {
         match self {
             Self::Fixed(0) => Err(BedrockWorldError::Validation(
@@ -605,35 +786,42 @@ impl WorldThreadingOptions {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Shareable cancellation flag for world operations.
 pub struct CancelFlag(Arc<AtomicBool>);
 
 impl CancelFlag {
     #[must_use]
+    /// Creates a new uncancelled flag.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Requests cancellation for operations sharing this flag.
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
 
     #[must_use]
+    /// Creates a flag from a shared atomic cancellation marker.
     pub fn from_shared(cancelled: Arc<AtomicBool>) -> Self {
         Self(cancelled)
     }
 
     #[must_use]
+    /// Converts this flag into a storage-layer cancellation flag.
     pub fn to_storage_cancel(&self) -> StorageCancelFlag {
         StorageCancelFlag::from_shared(Arc::clone(&self.0))
     }
 
     #[must_use]
+    /// Returns whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
 }
 
 #[derive(Clone)]
+/// Callback sink for world scan progress.
 pub struct ProgressSink {
     inner: Arc<Mutex<Box<dyn FnMut(WorldScanProgress) + Send>>>,
 }
@@ -648,6 +836,7 @@ impl std::fmt::Debug for ProgressSink {
 
 impl ProgressSink {
     #[must_use]
+    /// Creates a progress sink from a callback invoked during scans.
     pub fn new(callback: impl FnMut(WorldScanProgress) + Send + 'static) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Box::new(callback))),
@@ -662,11 +851,14 @@ impl ProgressSink {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Progress update emitted during world scans.
 pub struct WorldScanProgress {
+    /// Number of entries observed when progress was emitted.
     pub entries_seen: usize,
 }
 
 impl BedrockWorld<Arc<dyn WorldStorage>> {
+    /// Opens a world on the calling thread with automatic format detection.
     pub fn open_blocking(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let format = detect_world_format(&path, options.format)?;
@@ -703,6 +895,7 @@ impl BedrockWorld<Arc<dyn WorldStorage>> {
     }
 
     #[cfg(feature = "async")]
+    /// Opens a world on a blocking worker thread and returns an async handle.
     pub async fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         tokio::task::spawn_blocking(move || Self::open_blocking(path, options))
@@ -711,6 +904,7 @@ impl BedrockWorld<Arc<dyn WorldStorage>> {
     }
 
     #[must_use]
+    /// Creates a world handle from an already-open storage backend.
     pub fn from_storage(
         path: impl Into<PathBuf>,
         storage: Arc<dyn WorldStorage>,
@@ -725,6 +919,7 @@ impl BedrockWorld<Arc<dyn WorldStorage>> {
     }
 
     #[must_use]
+    /// Creates a world handle from an already-open storage backend and explicit format.
     pub fn from_storage_with_format(
         path: impl Into<PathBuf>,
         storage: Arc<dyn WorldStorage>,
@@ -741,6 +936,7 @@ impl BedrockWorld<Arc<dyn WorldStorage>> {
 }
 
 impl BedrockWorld<BedrockLevelDbStorage> {
+    /// Opens a world with a concrete `BedrockLevelDbStorage` backend on the calling thread.
     pub fn open_typed_blocking(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let format = detect_world_format(&path, options.format)?;
@@ -771,6 +967,7 @@ where
     S: WorldStorageHandle,
 {
     #[must_use]
+    /// Creates a world handle from a concrete storage backend.
     pub fn from_typed_storage(path: impl Into<PathBuf>, storage: S, options: OpenOptions) -> Self {
         Self {
             path: path.into(),
@@ -781,6 +978,7 @@ where
     }
 
     #[must_use]
+    /// Creates a world handle from a concrete storage backend and explicit format.
     pub fn from_typed_storage_with_format(
         path: impl Into<PathBuf>,
         storage: S,
@@ -796,29 +994,35 @@ where
     }
 
     #[must_use]
+    /// Returns the underlying raw storage backend.
     pub fn storage(&self) -> &dyn WorldStorage {
         self.storage.storage()
     }
 
     #[must_use]
+    /// Returns the world folder path.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     #[must_use]
+    /// Returns the detected world storage format.
     pub const fn format(&self) -> WorldFormat {
         self.format
     }
 
+    /// Read level dat blocking.
     pub fn read_level_dat_blocking(&self) -> Result<LevelDatDocument> {
         read_level_dat_document(&self.path.join("level.dat"))
     }
 
+    /// Write level dat blocking.
     pub fn write_level_dat_blocking(&self, document: &LevelDatDocument) -> Result<()> {
         self.ensure_writable()?;
         write_level_dat_document(&self.path.join("level.dat"), document)
     }
 
+    /// List players blocking.
     pub fn list_players_blocking(&self) -> Result<Vec<PlayerId>> {
         let mut players = Vec::new();
         if self.storage().get(b"~local_player")?.is_some() {
@@ -837,6 +1041,7 @@ where
         Ok(players)
     }
 
+    /// Classify keys blocking.
     pub fn classify_keys_blocking(
         &self,
         options: WorldScanOptions,
@@ -858,6 +1063,7 @@ where
         Ok(counts)
     }
 
+    /// List chunk positions blocking.
     pub fn list_chunk_positions_blocking(
         &self,
         options: WorldScanOptions,
@@ -879,6 +1085,7 @@ where
         Ok(positions.into_iter().collect())
     }
 
+    /// List render chunk positions blocking.
     pub fn list_render_chunk_positions_blocking(
         &self,
         options: WorldScanOptions,
@@ -923,6 +1130,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
+    /// List render chunk positions in region blocking.
     pub fn list_render_chunk_positions_in_region_blocking(
         &self,
         region: RenderChunkRegion,
@@ -1044,6 +1252,7 @@ where
         })
     }
 
+    /// Discover chunk bounds blocking.
     pub fn discover_chunk_bounds_blocking(
         &self,
         dimension: crate::Dimension,
@@ -1073,6 +1282,7 @@ where
         Ok(bounds)
     }
 
+    /// Nearest loaded chunk to spawn blocking.
     pub fn nearest_loaded_chunk_to_spawn_blocking(
         &self,
         dimension: crate::Dimension,
@@ -1112,6 +1322,7 @@ where
         Ok(best.map(|(_, pos)| pos))
     }
 
+    /// Get player blocking.
     pub fn get_player_blocking(&self, id: &PlayerId) -> Result<Option<PlayerData>> {
         let Some(key) = id.storage_key() else {
             if *id == PlayerId::LegacyLevelDat {
@@ -1126,6 +1337,7 @@ where
             .transpose()
     }
 
+    /// Put player blocking.
     pub fn put_player_blocking(&self, player: &PlayerData) -> Result<()> {
         self.ensure_writable()?;
         let Some(key) = player.id.storage_key() else {
@@ -1136,6 +1348,7 @@ where
         self.storage().put(key.as_ref(), &player.raw)
     }
 
+    /// Get chunk blocking.
     pub fn get_chunk_blocking(&self, pos: ChunkPos) -> Result<Chunk> {
         let mut records = Vec::new();
         let prefix = chunk_record_prefix(pos);
@@ -1165,20 +1378,24 @@ where
         })
     }
 
+    /// Reads and decodes a subchunk on the calling thread.
     pub fn get_subchunk_blocking(&self, pos: ChunkPos, y: i8) -> Result<Option<crate::SubChunk>> {
         self.get_chunk_blocking(pos)?.get_subchunk(y)
     }
 
+    /// Parses the world on the calling thread using the selected retention options.
     pub fn parse_world_blocking(&self, options: WorldParseOptions) -> Result<ParsedWorld> {
         let level_dat = self.read_level_dat_blocking()?;
         parse_world_storage(level_dat, self.storage(), options)
     }
 
+    /// Parses all known records for one chunk on the calling thread.
     pub fn parse_chunk_blocking(&self, pos: ChunkPos) -> Result<ParsedChunkData> {
         let chunk = self.get_chunk_blocking(pos)?;
         Ok(parse_chunk_records(pos, chunk.records))
     }
 
+    /// Parses one chunk on the calling thread using custom parse options.
     pub fn parse_chunk_with_options_blocking(
         &self,
         pos: ChunkPos,
@@ -1192,6 +1409,7 @@ where
         ))
     }
 
+    /// Parse subchunk blocking.
     pub fn parse_subchunk_blocking(
         &self,
         pos: ChunkPos,
@@ -1205,6 +1423,7 @@ where
             .transpose()
     }
 
+    /// Get biome storage blocking.
     pub fn get_biome_storage_blocking(
         &self,
         pos: ChunkPos,
@@ -1221,6 +1440,7 @@ where
         Ok(None)
     }
 
+    /// Get biome storages blocking.
     pub fn get_biome_storages_blocking(
         &self,
         pos: ChunkPos,
@@ -1275,6 +1495,7 @@ where
         Ok(found)
     }
 
+    /// Get height at blocking.
     pub fn get_height_at_blocking(
         &self,
         pos: ChunkPos,
@@ -1287,6 +1508,7 @@ where
             .and_then(|heights| heights[usize::from(local_z)][usize::from(local_x)]))
     }
 
+    /// Get height map blocking.
     pub fn get_height_map_blocking(
         &self,
         pos: ChunkPos,
@@ -1305,6 +1527,7 @@ where
         Ok(None)
     }
 
+    /// Get legacy biome colors blocking.
     pub fn get_legacy_biome_colors_blocking(
         &self,
         pos: ChunkPos,
@@ -1317,6 +1540,7 @@ where
         Ok(Some(render_biome_colors_from_legacy_terrain(&terrain)))
     }
 
+    /// Get legacy biome samples blocking.
     pub fn get_legacy_biome_samples_blocking(
         &self,
         pos: ChunkPos,
@@ -1329,6 +1553,7 @@ where
         Ok(Some(render_biomes_from_legacy_terrain(&terrain)))
     }
 
+    /// Get legacy biome color blocking.
     pub fn get_legacy_biome_color_blocking(
         &self,
         pos: ChunkPos,
@@ -1341,6 +1566,7 @@ where
             .and_then(|colors| colors[usize::from(local_z)][usize::from(local_x)]))
     }
 
+    /// Get legacy biome sample blocking.
     pub fn get_legacy_biome_sample_blocking(
         &self,
         pos: ChunkPos,
@@ -1353,6 +1579,7 @@ where
             .and_then(|samples| samples[usize::from(local_z)][usize::from(local_x)]))
     }
 
+    /// Get biome id blocking.
     pub fn get_biome_id_blocking(
         &self,
         pos: ChunkPos,
@@ -1367,6 +1594,7 @@ where
         Ok(biome_id_from_storage(&storage, local_x, local_z, y))
     }
 
+    /// Get surface column blocking.
     pub fn get_surface_column_blocking(
         &self,
         pos: ChunkPos,
@@ -1406,6 +1634,7 @@ where
         Ok(None)
     }
 
+    /// Load render chunk blocking.
     pub fn load_render_chunk_blocking(
         &self,
         pos: ChunkPos,
@@ -1417,6 +1646,7 @@ where
         })
     }
 
+    /// Load render chunks blocking.
     pub fn load_render_chunks_blocking(
         &self,
         positions: impl IntoIterator<Item = ChunkPos>,
@@ -1427,6 +1657,7 @@ where
             .0)
     }
 
+    /// Load render chunks with stats blocking.
     pub fn load_render_chunks_with_stats_blocking(
         &self,
         positions: impl IntoIterator<Item = ChunkPos>,
@@ -1687,6 +1918,7 @@ where
         Ok(elapsed)
     }
 
+    /// Load render region blocking.
     pub fn load_render_region_blocking(
         &self,
         region: RenderChunkRegion,
@@ -1721,6 +1953,7 @@ where
         })
     }
 
+    /// Get block state at blocking.
     pub fn get_block_state_at_blocking(
         &self,
         dimension: crate::Dimension,
@@ -1747,6 +1980,7 @@ where
         Ok(subchunk.block_state_at(local_x, local_y, local_z).cloned())
     }
 
+    /// Decodes the subchunk layer containing the requested world Y coordinate.
     pub fn get_subchunk_layer_blocking(
         &self,
         pos: ChunkPos,
@@ -1812,10 +2046,12 @@ where
         Ok((depth, None))
     }
 
+    /// Parse global data blocking.
     pub fn parse_global_data_blocking(&self) -> Result<Vec<ParsedDbEntry>> {
         parse_global_storage_entries(self.storage(), WorldParseOptions::summary())
     }
 
+    /// Scan entities blocking.
     pub fn scan_entities_blocking(
         &self,
         options: WorldScanOptions,
@@ -1844,6 +2080,7 @@ where
         Ok((entities, report))
     }
 
+    /// Scan block entities blocking.
     pub fn scan_block_entities_blocking(
         &self,
         options: WorldScanOptions,
@@ -1868,6 +2105,7 @@ where
         Ok((block_entities, report))
     }
 
+    /// Scan items blocking.
     pub fn scan_items_blocking(
         &self,
         options: WorldScanOptions,
@@ -2020,6 +2258,7 @@ where
             .collect())
     }
 
+    /// Scan villages lightweight blocking.
     pub fn scan_villages_lightweight_blocking(
         &self,
         cancel: &CancelFlag,
@@ -2462,6 +2701,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// List players.
     pub async fn list_players(&self) -> Result<Vec<PlayerId>> {
         let world = self.blocking_clone();
         tokio::task::spawn_blocking(move || world.list_players_blocking())
@@ -2470,6 +2710,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Classify keys.
     pub async fn classify_keys(
         &self,
         options: WorldScanOptions,
@@ -2481,6 +2722,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// List chunk positions.
     pub async fn list_chunk_positions(&self, options: WorldScanOptions) -> Result<Vec<ChunkPos>> {
         let world = self.blocking_clone();
         tokio::task::spawn_blocking(move || world.list_chunk_positions_blocking(options))
@@ -2489,6 +2731,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// List render chunk positions.
     pub async fn list_render_chunk_positions(
         &self,
         options: WorldScanOptions,
@@ -2500,6 +2743,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// List render chunk positions in region.
     pub async fn list_render_chunk_positions_in_region(
         &self,
         region: RenderChunkRegion,
@@ -2514,6 +2758,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Discover chunk bounds.
     pub async fn discover_chunk_bounds(
         &self,
         dimension: crate::Dimension,
@@ -2528,6 +2773,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Nearest loaded chunk to spawn.
     pub async fn nearest_loaded_chunk_to_spawn(
         &self,
         dimension: crate::Dimension,
@@ -2549,6 +2795,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Parse chunk.
     pub async fn parse_chunk(
         &self,
         pos: ChunkPos,
@@ -2561,6 +2808,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Load render chunk.
     pub async fn load_render_chunk(
         &self,
         pos: ChunkPos,
@@ -2573,6 +2821,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Load render chunks.
     pub async fn load_render_chunks(
         &self,
         positions: Vec<ChunkPos>,
@@ -2585,6 +2834,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Load render region.
     pub async fn load_render_region(
         &self,
         region: RenderChunkRegion,
@@ -2597,6 +2847,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Scan entities.
     pub async fn scan_entities(
         &self,
         options: WorldScanOptions,
@@ -2608,6 +2859,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Scan block entities.
     pub async fn scan_block_entities(
         &self,
         options: WorldScanOptions,
@@ -2619,6 +2871,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Scan items.
     pub async fn scan_items(
         &self,
         options: WorldScanOptions,
@@ -2630,6 +2883,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Scan maps.
     pub async fn scan_maps(&self) -> Result<Vec<ParsedMapData>> {
         let world = self.blocking_clone();
         tokio::task::spawn_blocking(move || world.scan_maps_blocking())
@@ -2638,6 +2892,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Scan villages.
     pub async fn scan_villages(&self) -> Result<Vec<ParsedVillageData>> {
         let world = self.blocking_clone();
         tokio::task::spawn_blocking(move || world.scan_villages_blocking())
@@ -2646,6 +2901,7 @@ where
     }
 
     #[cfg(feature = "async")]
+    /// Scan globals.
     pub async fn scan_globals(&self) -> Result<Vec<ParsedGlobalData>> {
         let world = self.blocking_clone();
         tokio::task::spawn_blocking(move || world.scan_globals_blocking())
@@ -2985,17 +3241,20 @@ where
         }
     }
 
+    /// Put raw record blocking.
     pub fn put_raw_record_blocking(&self, key: &ChunkKey, value: &[u8]) -> Result<()> {
         self.ensure_writable()?;
         self.storage().put(&key.encode(), value)
     }
 
+    /// Delete raw record blocking.
     pub fn delete_raw_record_blocking(&self, key: &ChunkKey) -> Result<()> {
         self.ensure_writable()?;
         self.storage().delete(&key.encode())
     }
 
     #[must_use]
+    /// Starts a buffered world transaction.
     pub fn transaction(&self) -> WorldTransaction<'_, S> {
         WorldTransaction {
             storage: &self.storage,
@@ -6502,6 +6761,7 @@ fn is_water_block_name(name: &str) -> bool {
     )
 }
 
+/// Terrain surface role.
 pub fn terrain_surface_role(name: &str) -> TerrainSurfaceRole {
     if is_air_block_name(name) {
         return TerrainSurfaceRole::Air;
@@ -6515,6 +6775,7 @@ pub fn terrain_surface_role(name: &str) -> TerrainSurfaceRole {
     TerrainSurfaceRole::Primary
 }
 
+/// Terrain surface overlay alpha.
 pub fn terrain_surface_overlay_alpha(name: &str) -> Option<u8> {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
     if name.contains("carpet") {

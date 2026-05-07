@@ -55,6 +55,7 @@ pub struct LevelDatDocument {
 
 impl LevelDatDocument {
     #[must_use]
+    /// Creates a document with the given format version and root tag.
     pub fn new(version: u32, root: NbtTag) -> Self {
         Self {
             header: LevelDatHeader {
@@ -68,6 +69,7 @@ impl LevelDatDocument {
     }
 
     #[must_use]
+    /// Returns the Bedrock `level.dat` format version from the header.
     pub const fn version(&self) -> u32 {
         self.header.version
     }

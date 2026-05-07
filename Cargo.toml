@@ -30,6 +30,9 @@ include = [
 name = "bedrock_world"
 path = "src/bedrock_world.rs"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["async", "backend-bedrock-leveldb"]
 async = ["dep:tokio"]

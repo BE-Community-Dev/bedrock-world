@@ -69,24 +69,39 @@ pub type NbtValue = NbtTag;
 #[derive(Debug, Clone, PartialEq)]
 /// Borrow-friendly view of an NBT tag.
 pub enum NbtRef<'a> {
+    /// The End dimension.
     End,
+    /// Byte variant.
     Byte(i8),
+    /// Short variant.
     Short(i16),
+    /// Int variant.
     Int(i32),
+    /// Long variant.
     Long(i64),
+    /// Float variant.
     Float(f32),
+    /// Double variant.
     Double(f64),
+    /// Byte array variant.
     ByteArray(Cow<'a, [i8]>),
+    /// String variant.
     String(Cow<'a, str>),
+    /// List variant.
     List(Vec<NbtRef<'a>>),
+    /// Compound variant.
     Compound(Vec<(Cow<'a, str>, NbtRef<'a>)>),
+    /// Int array variant.
     IntArray(Cow<'a, [i32]>),
+    /// Long array variant.
     LongArray(Cow<'a, [i64]>),
+    /// Short array variant.
     ShortArray(Cow<'a, [i16]>),
 }
 
 impl NbtRef<'_> {
     #[must_use]
+    /// Converts this borrowed view into an owned [`NbtTag`].
     pub fn to_owned_tag(&self) -> NbtTag {
         match self {
             Self::End => NbtTag::End,
@@ -119,22 +134,27 @@ pub struct NbtReader<'a> {
 
 impl<'a> NbtReader<'a> {
     #[must_use]
+    /// Creates a reader over a complete in-memory Bedrock NBT payload.
     pub const fn new(data: &'a [u8]) -> Self {
         Self { data }
     }
 
+    /// Parses the payload as a single root NBT tag.
     pub fn parse_root(&self) -> Result<NbtTag> {
         parse_root_nbt(self.data)
     }
 
+    /// Parses one root NBT tag and returns the number of bytes consumed.
     pub fn parse_root_with_consumed(&self) -> Result<(NbtTag, usize)> {
         parse_root_nbt_with_consumed(self.data)
     }
 
+    /// Parses one root tag and exposes it through a borrowed-style view.
     pub fn parse_root_ref(&self) -> Result<NbtRef<'a>> {
         self.parse_root().map(NbtRef::from_owned)
     }
 
+    /// Returns a borrowed view over the same raw payload.
     pub fn view(&self) -> NbtView<'a> {
         NbtView::new(self.data)
     }
@@ -148,10 +168,12 @@ pub struct NbtView<'a> {
 
 impl<'a> NbtView<'a> {
     #[must_use]
+    /// Creates a borrowed view over a complete in-memory Bedrock NBT payload.
     pub const fn new(data: &'a [u8]) -> Self {
         Self { data }
     }
 
+    /// Parses the payload into a flat stream of borrowed NBT events.
     pub fn events(&self) -> Result<Vec<NbtEvent<'a>>> {
         parse_nbt_events(self.data)
     }
@@ -160,61 +182,105 @@ impl<'a> NbtView<'a> {
 #[derive(Debug, Clone, PartialEq)]
 /// Borrowed NBT parse event.
 pub enum NbtEvent<'a> {
+    /// Begin compound variant.
     BeginCompound {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
     },
+    /// End compound variant.
     EndCompound,
+    /// Begin list variant.
     BeginList {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Raw NBT tag id used by every element in this list.
         element_type: u8,
+        /// Number of elements declared by the list header.
         len: usize,
     },
+    /// End list variant.
     EndList,
+    /// Byte variant.
     Byte {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Parsed or raw value associated with this record.
         value: i8,
     },
+    /// Short variant.
     Short {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Parsed or raw value associated with this record.
         value: i16,
     },
+    /// Int variant.
     Int {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Parsed or raw value associated with this record.
         value: i32,
     },
+    /// Long variant.
     Long {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Parsed or raw value associated with this record.
         value: i64,
     },
+    /// Float variant.
     Float {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Parsed or raw value associated with this record.
         value: f32,
     },
+    /// Double variant.
     Double {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Parsed or raw value associated with this record.
         value: f64,
     },
+    /// String variant.
     String {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Parsed or raw value associated with this record.
         value: &'a str,
     },
+    /// Byte array variant.
     ByteArray {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Raw payload bytes preserved for unsupported formats.
         bytes: &'a [u8],
     },
+    /// Int array variant.
     IntArray {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Raw payload bytes preserved for unsupported formats.
         bytes: &'a [u8],
+        /// Number of 32-bit integers declared by the array header.
         len: usize,
     },
+    /// Long array variant.
     LongArray {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Raw payload bytes preserved for unsupported formats.
         bytes: &'a [u8],
+        /// Number of 64-bit integers declared by the array header.
         len: usize,
     },
+    /// Short array variant.
     ShortArray {
+        /// Named Bedrock value or identifier.
         name: Option<&'a str>,
+        /// Raw payload bytes preserved for unsupported formats.
         bytes: &'a [u8],
+        /// Number of 16-bit integers declared by the array header.
         len: usize,
     },
 }
@@ -249,6 +315,7 @@ impl NbtRef<'_> {
 pub struct NbtWriter;
 
 impl NbtWriter {
+    /// Write root.
     pub fn write_root(tag: &NbtTag) -> Result<Vec<u8>> {
         serialize_root_nbt(tag)
     }
@@ -509,6 +576,7 @@ fn validate_nbt_tag_for_write(tag: &NbtTag, depth: usize, path: &str) -> Result<
     }
 }
 
+/// Nbt tags equal for write.
 pub fn nbt_tags_equal_for_write(left: &NbtTag, right: &NbtTag) -> bool {
     match (left, right) {
         (NbtTag::End, NbtTag::End) => true,

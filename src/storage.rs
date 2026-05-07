@@ -19,29 +19,52 @@ use std::sync::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Owned raw key/value storage entry.
 pub struct StorageEntry {
+    /// Decoded storage key for this record.
     pub key: Bytes,
+    /// Parsed or raw value associated with this record.
     pub value: Bytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Borrowed raw key/value storage entry view.
 pub struct StorageEntryRef<'a> {
+    /// Decoded storage key for this record.
     pub key: &'a [u8],
+    /// Parsed or raw value associated with this record.
     pub value: &'a [u8],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Raw storage mutation operation.
 pub enum StorageOp {
-    Put { key: Bytes, value: Bytes },
-    Delete { key: Bytes },
+    /// Writes or replaces a raw storage value.
+    Put {
+        /// Decoded storage key for this record.
+        key: Bytes,
+        /// Raw value bytes written for the key.
+        value: Bytes,
+    },
+    /// Delete operation.
+    Delete {
+        /// Decoded storage key for this record.
+        key: Bytes,
+    },
 }
 
 #[derive(Debug, Clone)]
+/// Options controlling raw storage reads and scans.
 pub struct StorageReadOptions {
+    /// Threading policy for this operation.
     pub threading: StorageThreadingOptions,
+    /// Scan strategy requested from the backend.
     pub scan_mode: StorageScanMode,
+    /// Bounded pipeline settings for this operation.
     pub pipeline: StoragePipelineOptions,
+    /// Optional cancellation flag checked during long-running work.
     pub cancel: Option<StorageCancelFlag>,
+    /// Optional progress sink invoked during long-running work.
     pub progress: Option<StorageProgressSink>,
 }
 
@@ -58,46 +81,69 @@ impl Default for StorageReadOptions {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Bounded pipeline settings for storage scans.
 pub struct StoragePipelineOptions {
+    /// Maximum queued work items; zero selects an automatic default.
     pub queue_depth: usize,
+    /// Table batch size; zero selects an automatic default.
     pub table_batch_size: usize,
+    /// Progress callback interval; zero selects an automatic default.
     pub progress_interval: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Threading policy for storage operations.
 pub enum StorageThreadingOptions {
     #[default]
+    /// Automatically choose the appropriate mode.
     Auto,
+    /// Use a fixed worker count.
     Fixed(usize),
+    /// Use a single worker.
     Single,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Scan strategy requested from a storage backend.
 pub enum StorageScanMode {
     #[default]
+    /// Scan sequentially.
     Sequential,
+    /// Scan backend tables in parallel when supported.
     ParallelTables,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Visitor control flow for storage scans.
 pub enum StorageVisitorControl {
+    /// Continue visiting records.
     Continue,
+    /// Stop visiting records.
     Stop,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Diagnostics collected by a storage scan.
 pub struct StorageScanOutcome {
+    /// Number of entries visited by the scan.
     pub visited: usize,
+    /// Number of value bytes read while scanning.
     pub bytes_read: usize,
+    /// Whether a visitor requested early termination.
     pub stopped: bool,
+    /// Number of backend tables scanned.
     pub tables_scanned: usize,
+    /// Number of worker threads used by the operation.
     pub worker_threads: usize,
+    /// Milliseconds spent waiting for bounded pipeline capacity.
     pub queue_wait_ms: u128,
+    /// Number of cancellation checks performed.
     pub cancel_checks: usize,
 }
 
 impl StorageScanOutcome {
     #[must_use]
+    /// Returns an empty scan outcome with all counters set to zero.
     pub const fn empty() -> Self {
         Self {
             visited: 0,
@@ -110,11 +156,13 @@ impl StorageScanOutcome {
         }
     }
 
+    /// Records one visited value and its byte length.
     pub fn record(&mut self, value_len: usize) {
         self.visited = self.visited.saturating_add(1);
         self.bytes_read = self.bytes_read.saturating_add(value_len);
     }
 
+    /// Merges another scan outcome into this one.
     pub fn merge(&mut self, other: Self) {
         self.visited = self.visited.saturating_add(other.visited);
         self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
@@ -127,30 +175,36 @@ impl StorageScanOutcome {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Shareable cancellation flag for storage operations.
 pub struct StorageCancelFlag(Arc<AtomicBool>);
 
 impl StorageCancelFlag {
     #[must_use]
+    /// Creates a new value.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Requests cancellation for operations sharing this flag.
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
 
     #[must_use]
+    /// Creates a cancellation flag from a shared atomic boolean.
     pub fn from_shared(cancelled: Arc<AtomicBool>) -> Self {
         Self(cancelled)
     }
 
     #[must_use]
+    /// Returns whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
 }
 
 #[derive(Clone)]
+/// Callback sink for storage progress updates.
 pub struct StorageProgressSink {
     inner: Arc<dyn Fn(StorageScanProgress) + Send + Sync>,
 }
@@ -165,34 +219,42 @@ impl std::fmt::Debug for StorageProgressSink {
 
 impl StorageProgressSink {
     #[must_use]
+    /// Creates a new value.
     pub fn new(callback: impl Fn(StorageScanProgress) + Send + Sync + 'static) -> Self {
         Self {
             inner: Arc::new(callback),
         }
     }
 
+    /// Emits a progress update to the callback.
     pub fn emit(&self, progress: StorageScanProgress) {
         (self.inner)(progress);
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Progress update emitted by a storage backend.
 pub struct StorageScanProgress {
+    /// Number of entries observed when progress was emitted.
     pub entries_seen: usize,
+    /// Number of value bytes read while scanning.
     pub bytes_read: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Buffered batch of raw storage operations.
 pub struct StorageBatch {
     ops: Vec<StorageOp>,
 }
 
 impl StorageBatch {
     #[must_use]
+    /// Creates a new value.
     pub const fn new() -> Self {
         Self { ops: Vec::new() }
     }
 
+    /// Adds a raw put operation to this batch.
     pub fn put(&mut self, key: impl Into<Bytes>, value: impl Into<Bytes>) {
         self.ops.push(StorageOp::Put {
             key: key.into(),
@@ -200,21 +262,25 @@ impl StorageBatch {
         });
     }
 
+    /// Adds a raw delete operation to this batch.
     pub fn delete(&mut self, key: impl Into<Bytes>) {
         self.ops.push(StorageOp::Delete { key: key.into() });
     }
 
     #[must_use]
+    /// Returns whether this batch contains no operations.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 
     #[must_use]
+    /// Returns the buffered operations.
     pub fn ops(&self) -> &[StorageOp] {
         &self.ops
     }
 }
 
+/// Raw key/value storage abstraction used by [`BedrockWorld`](crate::BedrockWorld).
 pub trait WorldStorage: Send + Sync {
     /// Looks up a raw value by exact key.
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
@@ -293,12 +359,14 @@ pub trait WorldStorage: Send + Sync {
 }
 
 #[derive(Debug, Clone, Default)]
+/// In-memory storage backend for tests and synthetic tools.
 pub struct MemoryStorage {
     values: Arc<RwLock<BTreeMap<Vec<u8>, Bytes>>>,
 }
 
 impl MemoryStorage {
     #[must_use]
+    /// Creates a new value.
     pub fn new() -> Self {
         Self::default()
     }
@@ -440,6 +508,7 @@ const POCKET_CHUNKS_DAT_SECTOR_BYTES: usize = 4096;
 const DEFAULT_LEGACY_BIOME_SAMPLE: [u8; 4] = [1, 0x7f, 0xb2, 0x38];
 
 #[derive(Debug, Clone)]
+/// Read-only backend for pre-LevelDB Pocket Edition chunks.dat worlds.
 pub struct PocketChunksDatStorage {
     values: Arc<BTreeMap<Vec<u8>, Bytes>>,
     origin_chunk_x: i32,
@@ -447,6 +516,7 @@ pub struct PocketChunksDatStorage {
 }
 
 impl PocketChunksDatStorage {
+    /// Opens a read-only backend for a pre-`LevelDB` Pocket Edition world folder.
     pub fn open(world_path: impl AsRef<Path>) -> Result<Self> {
         let world_path = world_path.as_ref();
         let chunks_path = world_path.join("chunks.dat");
@@ -477,11 +547,13 @@ impl PocketChunksDatStorage {
     }
 
     #[must_use]
+    /// Origin chunk x.
     pub const fn origin_chunk_x(&self) -> i32 {
         self.origin_chunk_x
     }
 
     #[must_use]
+    /// Origin chunk z.
     pub const fn origin_chunk_z(&self) -> i32 {
         self.origin_chunk_z
     }
@@ -693,11 +765,13 @@ fn pocket_chunks_dat_read_only_error() -> BedrockWorldError {
     BedrockWorldError::UnsupportedChunkFormat("Pocket chunks.dat storage is read-only".to_string())
 }
 
+/// Backend module.
 pub mod backend {
     use super::*;
 
     #[cfg(feature = "backend-bedrock-leveldb")]
     #[derive(Clone)]
+    /// Bedrock level db storage data model.
     pub struct BedrockLevelDbStorage {
         db: Arc<bedrock_leveldb::Db>,
     }
@@ -974,6 +1048,7 @@ pub mod backend {
 
     #[cfg(not(feature = "backend-bedrock-leveldb"))]
     #[derive(Debug, Clone, Copy)]
+    /// Placeholder backend returned when `backend-bedrock-leveldb` is disabled.
     pub struct BedrockLevelDbStorage;
 
     #[cfg(not(feature = "backend-bedrock-leveldb"))]
