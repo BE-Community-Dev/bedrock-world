@@ -12,9 +12,8 @@ The performance model is benchmark-backed rather than "femtosecond" marketing:
 hot paths avoid owned raw-value retention, use borrowed/event NBT views when a
 DOM is not needed, and keep shared cache locks opt-in.
 
-This crate does not generate map images and does not copy image/color generation
-code from `bedrock-dev/bedrock-level`. That project is used only as a parsing
-behavior reference.
+This crate focuses on complete parsing behavior. The
+`bedrock-dev/bedrock-level` project is referenced only for parsing behavior.
 
 ## Recommended API
 
@@ -292,7 +291,7 @@ should not be repeated inside microbenchmarks.
 | Players, entities, block entities, item stacks | Implemented common field extraction |
 | Unknown version-specific data | Preserved or counted according to retention mode |
 | Full structured editing for every chunk version | Not implemented |
-| Map image generation | Not implemented |
+| Map pixel record parsing | Implemented |
 
 Historical Bedrock worlds that predate LevelDB and store chunk data in
 `chunks.dat` / `entities.dat` are not database worlds; importing those files is
@@ -309,7 +308,6 @@ outside this crate's current scope.
 - For renderers, build a viewport `RenderChunkRegion` first and use the
   render-index APIs. Keep full `list_chunk_positions_blocking` for metadata,
   search, and offline export workflows.
-- This initial GitHub release is marked `publish = false` because
-  `bedrock-leveldb` is still consumed by pinned Git revision. Publish
-  `bedrock-leveldb` first, then switch this dependency to crates.io before
-  publishing `bedrock-world`.
+- The optional `bedrock-leveldb` backend uses a versioned dependency for
+  crates.io publishing and a local `../bedrock-leveldb` path for repository
+  development.

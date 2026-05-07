@@ -7,8 +7,7 @@
 terrain record 的 chunk/subchunk 解析、实体和方块实体解析、物品提取、biome summary，
 以及 typed map/village/global record 访问。
 
-本 crate 不生成地图图片，也不复制 `bedrock-dev/bedrock-level` 的图片/颜色生成代码；
-该项目只作为解析行为参考。
+本 crate 专注于完整解析行为；`bedrock-dev/bedrock-level` 项目仅作为解析行为参考。
 
 ## 推荐 API
 
@@ -246,7 +245,7 @@ players.count=290
 | 玩家、实体、方块实体、物品栈 | 已提取通用字段 |
 | 未知版本专属数据 | 按 retention mode raw 保留或计数 |
 | 所有 chunk 版本的完整结构化编辑 | 未实现 |
-| 地图图片生成 | 未实现 |
+| 地图像素记录解析 | 已实现 |
 
 早于 LevelDB 的 Bedrock 世界使用 `chunks.dat` / `entities.dat` 之类文件，不是数据库世界；
 这类文件导入目前不属于本 crate 的范围。
@@ -258,6 +257,5 @@ players.count=290
 - 只需要某一类数据时使用对应分类 API，避免不必要地解析实体、区块和 global records。
 - 渲染器应先构造视口 `RenderChunkRegion`，再使用 render-index API。完整
   `list_chunk_positions_blocking` 保留给元数据、搜索和离线导出场景。
-- 当前 GitHub 初始版本设置了 `publish = false`，因为 `bedrock-leveldb` 仍通过固定 Git
-  revision 使用。正式发布 crates.io 前应先发布 `bedrock-leveldb`，再把本依赖切换为
-  crates.io version。
+- 可选的 `bedrock-leveldb` 后端使用 versioned dependency 供 crates.io 发布，
+  并保留本仓库开发用的 `../bedrock-leveldb` 本地路径。

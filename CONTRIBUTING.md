@@ -46,7 +46,7 @@ When a regression needs fixture coverage, prefer one of these approaches:
 
 ## Dependency Policy
 
-`bedrock-world` depends on `bedrock-leveldb` by pinned Git revision until both
-crates are ready for crates.io publishing. Before publishing to crates.io,
-publish `bedrock-leveldb`, replace the Git dependency with a versioned crates.io
-dependency, and remove `publish = false` from `Cargo.toml`.
+`bedrock-world` depends on the public `bedrock-leveldb` crate with a versioned
+dependency. The repository also keeps a local `../bedrock-leveldb` path on that
+dependency so local development and release verification can exercise the
+adjacent checkout before publishing.

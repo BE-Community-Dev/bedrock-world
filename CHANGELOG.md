@@ -2,6 +2,18 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## 0.2.1 - 2026-05-07
+
+### Changed
+
+- Prepared the crate for publishing by removing `publish = false` and declaring
+  the optional `bedrock-leveldb` backend as a versioned `0.2.1` dependency while
+  retaining the local `../bedrock-leveldb` path for repository development.
+- Clarified documentation scope: `bedrock-world` focuses on complete parsing and
+  references `bedrock-dev/bedrock-level` only for parsing behavior.
+- Reframed map pixel support documentation as implemented parser coverage
+  instead of an unimplemented feature.
+
 ## 0.2.0 - 2026-05-07
 
 ### Added
