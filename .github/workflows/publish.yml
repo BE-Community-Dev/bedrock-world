@@ -20,12 +20,6 @@ jobs:
         with:
           toolchain: 1.87.0
           components: clippy, rustfmt
-      - name: Checkout bedrock-leveldb path dependency
-        uses: actions/checkout@v4
-        with:
-          repository: BE-Community-Dev/bedrock-leveldb
-          ref: ${{ github.ref_name }}
-          path: ../bedrock-leveldb
       - name: Verify tag matches crate version
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
