@@ -41,6 +41,21 @@ jobs:
           done
           echo "bedrock-leveldb $version is not resolvable from crates.io" >&2
           exit 1
+      - name: Use published bedrock-leveldb dependency
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          manifest = Path("Cargo.toml")
+          text = manifest.read_text()
+          text = re.sub(
+              r'(bedrock-leveldb = \{ version = "[^"]+", )path = "\.\./bedrock-leveldb", ',
+              r'\1',
+              text,
+          )
+          manifest.write_text(text)
+          PY
       - name: Format
         run: cargo fmt --check
       - name: Clippy
