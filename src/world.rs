@@ -382,10 +382,10 @@ impl TerrainColumnSamples {
 
     /// Stores a value at the requested coordinates.
     pub fn set(&mut self, local_x: u8, local_z: u8, sample: TerrainColumnSample) {
-        if let Some(index) = column_index(local_x, local_z)
-            && let Some(slot) = self.columns.get_mut(index)
-        {
-            *slot = Some(sample);
+        if let Some(index) = column_index(local_x, local_z) {
+            if let Some(slot) = self.columns.get_mut(index) {
+                *slot = Some(sample);
+            }
         }
     }
 
@@ -1104,10 +1104,10 @@ where
                 .for_each_key(to_storage_read_options(&options), &mut |key| {
                     check_cancelled(&options)?;
                     entries_seen = entries_seen.saturating_add(1);
-                    if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key)
-                        && chunk_key.tag.is_render_chunk_record()
-                    {
-                        positions.insert(chunk_key.pos);
+                    if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key) {
+                        if chunk_key.tag.is_render_chunk_record() {
+                            positions.insert(chunk_key.pos);
+                        }
                     }
                     if entries_seen.is_multiple_of(8192) {
                         emit_progress(&options, entries_seen);
@@ -3494,12 +3494,12 @@ fn check_render_load_cancelled(options: &RenderChunkLoadOptions) -> Result<()> {
 }
 
 fn emit_render_load_progress(options: &RenderChunkLoadOptions, completed_chunks: usize) {
-    if completed_chunks.is_multiple_of(options.pipeline.resolve_progress_interval())
-        && let Some(progress) = &options.progress
-    {
-        progress.emit(WorldScanProgress {
-            entries_seen: completed_chunks,
-        });
+    if completed_chunks.is_multiple_of(options.pipeline.resolve_progress_interval()) {
+        if let Some(progress) = &options.progress {
+            progress.emit(WorldScanProgress {
+                entries_seen: completed_chunks,
+            });
+        }
     }
 }
 
@@ -3900,7 +3900,8 @@ fn sample_column_top_down(
 
         if let Some((state, source)) =
             legacy_terrain_block_state_at(local_x, y, local_z, subchunks, legacy_terrain)
-            && let Some(sample) = scan_terrain_surface_state(
+        {
+            if let Some(sample) = scan_terrain_surface_state(
                 local_x,
                 local_z,
                 y,
@@ -3912,9 +3913,9 @@ fn sample_column_top_down(
                 &mut water_depth,
                 legacy_biomes,
                 render_biomes,
-            )
-        {
-            return Ok(Some(sample));
+            ) {
+                return Ok(Some(sample));
+            }
         }
     }
 
@@ -6518,11 +6519,12 @@ fn raw_height_mismatch_columns(chunk: &RenderChunkData) -> usize {
     let mut mismatches = 0usize;
     for local_z in 0..16_u8 {
         for local_x in 0..16_u8 {
-            if let Some(sample) = samples.get(local_x, local_z)
-                && height_map[usize::from(local_z)][usize::from(local_x)]
+            if let Some(sample) = samples.get(local_x, local_z) {
+                if height_map[usize::from(local_z)][usize::from(local_x)]
                     .is_some_and(|raw_height| raw_height != sample.surface_y)
-            {
-                mismatches = mismatches.saturating_add(1);
+                {
+                    mismatches = mismatches.saturating_add(1);
+                }
             }
         }
     }
@@ -6556,10 +6558,10 @@ fn needed_exact_surface_chunk_requires_full_reload(chunk: &RenderChunkData) -> R
         if block_y_to_subchunk_y(i32::from(sample.surface_y))? == loaded_max_subchunk_y {
             return Ok(true);
         }
-        if let Some(overlay) = sample.overlay.as_ref()
-            && block_y_to_subchunk_y(i32::from(overlay.y))? == loaded_max_subchunk_y
-        {
-            return Ok(true);
+        if let Some(overlay) = sample.overlay.as_ref() {
+            if block_y_to_subchunk_y(i32::from(overlay.y))? == loaded_max_subchunk_y {
+                return Ok(true);
+            }
         }
     }
     Ok(false)

@@ -1321,9 +1321,13 @@ impl Chunk {
                 });
             }
         }
-        if (0..=127).contains(&y)
-            && let Some(terrain) = self.legacy_terrain()?
-        {
+        if (0..=127).contains(&y) {
+            let Some(terrain) = self.legacy_terrain()? else {
+                return Err(BedrockWorldError::UnsupportedChunkFormat(format!(
+                    "chunk {:?} has no legacy terrain record",
+                    self.pos
+                )));
+            };
             let local_y = u8::try_from(y).map_err(|_| {
                 BedrockWorldError::Validation(format!("legacy block y={y} is outside 0..127"))
             })?;
