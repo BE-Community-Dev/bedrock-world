@@ -69,8 +69,8 @@ jobs:
       - name: Public API docs
         run: cargo rustdoc --all-features -- -D missing_docs
       - name: Dry run
-        run: cargo publish --dry-run
+        run: cargo publish --dry-run --allow-dirty
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --no-verify
+        run: cargo publish --no-verify --allow-dirty
