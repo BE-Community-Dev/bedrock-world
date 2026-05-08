@@ -32,13 +32,14 @@ jobs:
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           for attempt in $(seq 1 30); do
-            if cargo search bedrock-leveldb --limit 1 | grep -q "bedrock-leveldb = \"$version\""; then
+            if cargo info "bedrock-leveldb@$version" >/dev/null 2>&1; then
+              cargo info "bedrock-leveldb@$version"
               exit 0
             fi
-            echo "bedrock-leveldb $version not visible on crates.io yet; attempt $attempt/30"
+            echo "bedrock-leveldb $version not resolvable from crates.io yet; attempt $attempt/30"
             sleep 20
           done
-          echo "bedrock-leveldb $version is not visible on crates.io" >&2
+          echo "bedrock-leveldb $version is not resolvable from crates.io" >&2
           exit 1
       - name: Format
         run: cargo fmt --check
