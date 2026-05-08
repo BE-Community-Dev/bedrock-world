@@ -1700,21 +1700,22 @@ fn parse_village_key(key: &[u8]) -> Option<ParsedVillageKey> {
     if !matches!(parts.as_slice(), ["VILLAGE", ..]) || !matches!(parts.len(), 3 | 4) {
         return None;
     }
-    let dimension = if parts.len() == 4 {
-        Some(match parts[1] {
+    let (dimension, tail) = if parts.len() == 4 {
+        let dimension = match parts[1] {
             "Overworld" => Dimension::Overworld,
             "Nether" => Dimension::Nether,
             "TheEnd" => Dimension::End,
             _ => return None,
-        })
+        };
+        (Some(dimension), &parts[2..])
     } else {
-        None
+        (None, &parts[1..])
     };
-    let uuid = parts[parts.len() - 2];
+    let uuid = tail[0];
     if uuid.len() != 36 {
         return None;
     }
-    let kind = match parts[parts.len() - 1] {
+    let kind = match tail[1] {
         "INFO" => VillageRecordKind::Info,
         "DWELLERS" => VillageRecordKind::Dwellers,
         "PLAYERS" => VillageRecordKind::Players,
