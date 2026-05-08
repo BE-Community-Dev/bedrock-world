@@ -1265,13 +1265,13 @@ where
             .for_each_key(to_storage_read_options(&options), &mut |key| {
                 check_cancelled(&options)?;
                 entries_seen = entries_seen.saturating_add(1);
-                if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key)
-                    && chunk_key.pos.dimension == dimension
-                    && seen_positions.insert(chunk_key.pos)
-                {
-                    match &mut bounds {
-                        Some(bounds) => bounds.include(chunk_key.pos),
-                        None => bounds = Some(ChunkBounds::from_first(chunk_key.pos)),
+                if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key) {
+                    if chunk_key.pos.dimension == dimension && seen_positions.insert(chunk_key.pos)
+                    {
+                        match &mut bounds {
+                            Some(bounds) => bounds.include(chunk_key.pos),
+                            None => bounds = Some(ChunkBounds::from_first(chunk_key.pos)),
+                        }
                     }
                 }
                 if entries_seen.is_multiple_of(8192) {
@@ -1303,15 +1303,15 @@ where
             .for_each_key(to_storage_read_options(&options), &mut |key| {
                 check_cancelled(&options)?;
                 entries_seen = entries_seen.saturating_add(1);
-                if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key)
-                    && chunk_key.pos.dimension == dimension
-                    && seen_positions.insert(chunk_key.pos)
-                {
-                    let dx = i64::from(chunk_key.pos.x) - i64::from(spawn_chunk.x);
-                    let dz = i64::from(chunk_key.pos.z) - i64::from(spawn_chunk.z);
-                    let distance = dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz));
-                    if best.is_none_or(|(best_distance, _)| distance < best_distance) {
-                        best = Some((distance, chunk_key.pos));
+                if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key) {
+                    if chunk_key.pos.dimension == dimension && seen_positions.insert(chunk_key.pos)
+                    {
+                        let dx = i64::from(chunk_key.pos.x) - i64::from(spawn_chunk.x);
+                        let dz = i64::from(chunk_key.pos.z) - i64::from(spawn_chunk.z);
+                        let distance = dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz));
+                        if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+                            best = Some((distance, chunk_key.pos));
+                        }
                     }
                 }
                 if entries_seen.is_multiple_of(8192) {
@@ -1482,12 +1482,11 @@ where
             to_storage_read_options(options),
             &mut |key| {
                 check_cancelled(options)?;
-                if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key)
-                    && chunk_key.pos == pos
-                    && chunk_key.tag.is_render_chunk_record()
-                {
-                    found = true;
-                    return Ok(StorageVisitorControl::Stop);
+                if let BedrockDbKey::Chunk(chunk_key) = BedrockDbKey::decode(key) {
+                    if chunk_key.pos == pos && chunk_key.tag.is_render_chunk_record() {
+                        found = true;
+                        return Ok(StorageVisitorControl::Stop);
+                    }
                 }
                 Ok(StorageVisitorControl::Continue)
             },
