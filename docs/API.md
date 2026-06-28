@@ -200,7 +200,9 @@ Chunk payload helpers:
 All high-level writes validate the serialized value by parsing it back before
 committing. Actor writes update `actorprefix` and `digp` in one transaction.
 Block-entity writes reject coordinates outside the target chunk. `chunks.dat`
-backends stay read-only. Write examples should therefore open a writable world:
+backends stay read-only. Chunk deletion also removes modern actor digest and
+`actorprefix` records owned by the deleted chunks. Write examples should
+therefore open a writable world:
 
 ```rust
 let world = bedrock_world::BedrockWorld::open_blocking(
@@ -211,6 +213,39 @@ let world = bedrock_world::BedrockWorld::open_blocking(
     },
 )?;
 ```
+
+LevelDB backend writes use synced WAL-backed write options. Use
+`BedrockWorld::compact_storage_blocking` after a large write wave when an editor
+needs to force backend compaction before another process opens the world.
+
+## Structure Files
+
+`McStructureFile` reads and writes Bedrock `.mcstructure` files, which are
+uncompressed little-endian NBT files containing a structure size, block index
+arrays, a palette, and block entities. The helper can also export a world region
+and place a structure into writable world storage:
+
+```rust
+let structure = bedrock_world::McStructureFile::read_from_path("house.mcstructure".as_ref())?;
+let result = structure.write_to_world_blocking(
+    &world,
+    bedrock_world::McStructurePlacement {
+        source_anchor: bedrock_world::ChunkPos { x: 0, z: 0, dimension },
+        target_anchor: bedrock_world::ChunkPos { x: 8, z: -4, dimension },
+        origin_y: 64,
+        rotation: bedrock_world::McStructureRotation::Clockwise90,
+        mirror_x: false,
+        mirror_z: false,
+    },
+    Some(Box::new(|progress| eprintln!("{progress:?}"))),
+)?;
+println!("placed chunks={}", result.touched_chunks.len());
+```
+
+Placement updates subchunk records, preserves supported block entities, and
+applies horizontal rotation or mirroring to common direction-like block states.
+Entity placement is intentionally left to downstream tools because entity NBT
+semantics are not block-grid local.
 
 ## Parsing Modes
 

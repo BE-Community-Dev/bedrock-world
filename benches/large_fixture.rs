@@ -68,10 +68,7 @@ fn main() {
         "large_fixture.classify_keys.single elapsed_ms={} entries={} entries_per_sec={:.2}",
         elapsed.as_millis(),
         total_entries,
-        u32::try_from(total_entries)
-            .map(f64::from)
-            .unwrap_or(f64::INFINITY)
-            / elapsed.as_secs_f64()
+        u32::try_from(total_entries).map_or(f64::INFINITY, f64::from) / elapsed.as_secs_f64()
     );
 
     let start = Instant::now();
@@ -89,9 +86,7 @@ fn main() {
         "large_fixture.key_scan.generic elapsed_ms={} entries={} entries_per_sec={:.2} worker_threads={} tables_scanned={}",
         start.elapsed().as_millis(),
         key_scan.visited,
-        u32::try_from(key_scan.visited)
-            .map(f64::from)
-            .unwrap_or(f64::INFINITY)
+        u32::try_from(key_scan.visited).map_or(f64::INFINITY, f64::from)
             / start.elapsed().as_secs_f64(),
         key_scan.worker_threads,
         key_scan.tables_scanned
@@ -113,9 +108,7 @@ fn main() {
         "large_fixture.prefix_ref_scan.players elapsed_ms={} entries={} entries_per_sec={:.2} worker_threads={} prefix_scans=1",
         start.elapsed().as_millis(),
         prefix_scan.visited,
-        u32::try_from(prefix_scan.visited)
-            .map(f64::from)
-            .unwrap_or(f64::INFINITY)
+        u32::try_from(prefix_scan.visited).map_or(f64::INFINITY, f64::from)
             / start.elapsed().as_secs_f64(),
         prefix_scan.worker_threads
     );

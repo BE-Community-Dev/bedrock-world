@@ -2,6 +2,32 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## 0.2.2 - 2026-06-29
+
+### Added
+
+- Added `.mcstructure` read/write and world placement helpers through the
+  `mcstructure` module, including structure palette handling, chunk targeting,
+  rotation/mirroring, block-entity preservation, and placement progress.
+- Added `BedrockWorld::compact_storage_blocking` and `WorldStorage::compact`
+  so bulk-write tools can request explicit backend compaction after committing
+  changes.
+
+### Changed
+
+- Updated the optional `bedrock-leveldb` backend to `0.2.2`, kept the local
+  repository path for development, disabled default backend features, and
+  forwards zlib/snappy plus the async feature explicitly.
+- Changed LevelDB writes to use synced write options with WAL-backed writes and
+  made flush a cheap backend boundary. Transaction commits now persist the
+  batch and leave optional compaction to explicit callers.
+- Increased the NBT container limit for large Bedrock structure arrays.
+
+### Fixed
+
+- `delete_chunks_blocking` now removes modern actor digest and `actorprefix`
+  records for deleted chunks, not only the terrain records.
+
 ## 0.2.1 - 2026-05-07
 
 ### Changed

@@ -42,6 +42,8 @@ pub mod discover;
 pub mod error;
 /// `level.dat` header parsing, validation, and atomic write helpers.
 pub mod level_dat;
+/// Minecraft Bedrock `.mcstructure` files and world placement helpers.
+pub mod mcstructure;
 /// Little-endian Bedrock NBT reader and writer.
 pub mod nbt;
 /// Structured parsers for world, chunk, entity, biome, map, and village data.
@@ -71,6 +73,11 @@ pub use level_dat::{
 };
 #[cfg(feature = "async")]
 pub use level_dat::{read_level_dat_async, write_level_dat_atomic_async};
+pub use mcstructure::{
+    McStructureBlock, McStructureFile, McStructurePaletteEntry, McStructurePlacement,
+    McStructureRotation, McStructureSize, McStructureWritePhase, McStructureWriteProgress,
+    McStructureWriteResult, read_mcstructure_file, write_mcstructure_file,
+};
 pub use nbt::{NbtEvent, NbtReader, NbtRef, NbtTag, NbtValue, NbtView, NbtWriter};
 pub use parsed::{
     ActorRecord, ActorResolution, ActorSource, Biome2d, Biome3d, BlockEntityRecord,

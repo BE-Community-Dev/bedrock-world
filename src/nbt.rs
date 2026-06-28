@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::io::{Cursor, Read, Write};
 
 const MAX_NBT_DEPTH: usize = 128;
-const MAX_NBT_CONTAINER_LENGTH: usize = 1_000_000;
+const MAX_NBT_CONTAINER_LENGTH: usize = 134_217_728;
 const MAX_NBT_BYTE_LENGTH: usize = 32 * 1024 * 1024;
 const MAX_NBT_STRING_BYTES: usize = u16::MAX as usize;
 

@@ -6,7 +6,8 @@
 `bedrock-leveldb`. It provides fast `level.dat` access, little-endian NBT,
 Bedrock DB key classification, player reads, chunk/subchunk parsing including
 LevelDB-era legacy terrain records, entity and block-entity parsing, item
-extraction, biome summaries, and typed map/village/global record access.
+extraction, biome summaries, typed map/village/global record access, and
+Bedrock `.mcstructure` file import/export helpers.
 
 The performance model is benchmark-backed rather than "femtosecond" marketing:
 hot paths avoid owned raw-value retention, use borrowed/event NBT views when a
@@ -54,6 +55,9 @@ This crate focuses on complete parsing behavior. The
   update `digp -> actorprefix` records in one transaction. Block-entity writes
   validate coordinates against the target chunk. `PocketChunksDatStorage`
   remains read-only.
+- LevelDB backend writes use synced WAL-backed write options. Bulk editors can
+  call `compact_storage_blocking` after a write wave when they want an explicit
+  backend compaction boundary.
 - `bedrock-world` stops at Bedrock key/value semantics. Post-write refresh,
   invalidation, and presentation policy belong to downstream applications or
   adapter crates.
@@ -62,6 +66,10 @@ This crate focuses on complete parsing behavior. The
 - `WorldScanOptions` controls threading, cancellation, and progress callbacks.
 - `NbtReader::view().events()` provides a borrowed event stream for tools that
   need to inspect NBT without constructing an owned `NbtTag` DOM.
+- `McStructureFile::read_from_path`, `McStructureFile::from_world_region_blocking`,
+  and `McStructureFile::write_to_world_blocking` cover Bedrock
+  `.mcstructure` import, export, and placement. Placement supports chunk
+  targeting, Y offsets, horizontal rotation/mirroring, and block entities.
 - `WorldPipelineOptions` refines the bounded pipeline with queue depth, chunk
   batch size, subchunk decode worker budget, and progress cadence. Zero values
   choose automatic defaults.
@@ -338,6 +346,9 @@ outside this crate's current scope.
 - For renderers, build a viewport `RenderChunkRegion` first and use the
   render-index APIs. Keep full `list_chunk_positions_blocking` for metadata,
   search, and offline export workflows.
+- After large write waves, call `compact_storage_blocking` explicitly if the
+  tool wants LevelDB compaction before handing the world back to another
+  process.
 - The optional `bedrock-leveldb` backend uses a versioned dependency for
   crates.io publishing and a local `../bedrock-leveldb` path for repository
   development.

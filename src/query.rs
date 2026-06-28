@@ -5,11 +5,11 @@ use crate::nbt::{NbtTag, serialize_root_nbt};
 use crate::parsed::{
     ActorResolution, ParsedBlockEntity, ParsedChunkRecordValue, ParsedEntity,
     ParsedHardcodedSpawnArea, ParsedVillageData, RetentionMode, WorldParseCategories,
-    WorldParseOptions,
+    WorldParseOptions, parse_actor_digest_ids,
 };
 use crate::world::{BedrockWorld, ChunkBounds, SurfaceColumnOptions, WorldStorageHandle};
 use crate::{
-    BlockPos, CancelFlag, ChunkPos, ChunkRecordTag, Dimension, RenderChunkRegion,
+    ActorDigestKey, BlockPos, CancelFlag, ChunkPos, ChunkRecordTag, Dimension, RenderChunkRegion,
     SubChunkDecodeMode, SurfaceColumn,
 };
 use serde::{Deserialize, Serialize};
@@ -361,7 +361,7 @@ impl WriteGuard {
         }
     }
 
-    fn validate<S>(&self, world: &BedrockWorld<S>) -> Result<()>
+    pub(crate) fn validate<S>(&self, world: &BedrockWorld<S>) -> Result<()>
     where
         S: WorldStorageHandle,
     {
@@ -722,6 +722,14 @@ where
                 transaction.delete_raw_record(&record.key);
                 deleted = deleted.saturating_add(1);
             }
+            let actor_digest_key = ActorDigestKey::new(pos).storage_key();
+            if let Some(digest) = world.storage().get(&actor_digest_key)? {
+                for actor_uid in parse_actor_digest_ids(&digest)? {
+                    transaction.delete_raw_key(actor_uid.storage_key());
+                    deleted = deleted.saturating_add(1);
+                }
+            }
+            transaction.delete_raw_key(actor_digest_key);
         }
     }
     transaction.commit()?;
@@ -921,7 +929,10 @@ const fn temper(mut value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MemoryStorage, OpenOptions};
+    use crate::{
+        ActorDigestKey, ActorUid, ChunkKey, MemoryStorage, OpenOptions, ParsedEntity, WorldStorage,
+    };
+    use indexmap::IndexMap;
     use std::sync::Arc;
 
     #[test]
@@ -1066,5 +1077,85 @@ mod tests {
         )
         .expect_err("read-only world rejects writes");
         assert_eq!(error.kind(), crate::BedrockWorldErrorKind::ReadOnly);
+    }
+
+    #[test]
+    fn delete_chunks_removes_modern_actor_digest_and_prefix_records() {
+        let storage = Arc::new(MemoryStorage::new());
+        let world = BedrockWorld::from_storage(
+            "memory",
+            storage.clone(),
+            OpenOptions {
+                read_only: false,
+                ..OpenOptions::default()
+            },
+        );
+        let pos = ChunkPos {
+            x: 2,
+            z: 3,
+            dimension: Dimension::Overworld,
+        };
+        world
+            .put_raw_record_blocking(&ChunkKey::new(pos, ChunkRecordTag::Version), &[1])
+            .expect("write chunk record");
+        let actor = ParsedEntity {
+            identifier: Some("minecraft:pig".to_string()),
+            definitions: Vec::new(),
+            unique_id: Some(77),
+            position: Some([32.0, 64.0, 48.0]),
+            rotation: None,
+            motion: None,
+            items: Vec::new(),
+            nbt: NbtTag::Compound(IndexMap::from([
+                (
+                    "identifier".to_string(),
+                    NbtTag::String("minecraft:pig".to_string()),
+                ),
+                ("UniqueID".to_string(), NbtTag::Long(77)),
+                (
+                    "Pos".to_string(),
+                    NbtTag::List(vec![
+                        NbtTag::Float(32.0),
+                        NbtTag::Float(64.0),
+                        NbtTag::Float(48.0),
+                    ]),
+                ),
+            ])),
+        };
+        world.put_actor_blocking(pos, &actor).expect("write actor");
+
+        let guard = WriteGuard::confirmed("memory", "delete chunk actor data");
+        let deleted = delete_chunks_blocking(
+            &world,
+            SlimeChunkBounds {
+                dimension: pos.dimension,
+                min_chunk_x: pos.x,
+                max_chunk_x: pos.x,
+                min_chunk_z: pos.z,
+                max_chunk_z: pos.z,
+            },
+            &guard,
+        )
+        .expect("delete chunk");
+
+        assert_eq!(deleted, 2);
+        assert!(
+            storage
+                .get(&ChunkKey::new(pos, ChunkRecordTag::Version).encode())
+                .expect("read chunk record")
+                .is_none()
+        );
+        assert!(
+            storage
+                .get(&ActorDigestKey::new(pos).storage_key())
+                .expect("read actor digest")
+                .is_none()
+        );
+        assert!(
+            storage
+                .get(&ActorUid(77).storage_key())
+                .expect("read actor prefix")
+                .is_none()
+        );
     }
 }

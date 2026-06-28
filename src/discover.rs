@@ -110,7 +110,7 @@ pub fn discover_worlds(options: &WorldDiscovery) -> Result<Vec<WorldSummary>> {
             source_root,
         });
     }
-    worlds.sort_by(|left, right| right.modified.cmp(&left.modified));
+    worlds.sort_by_key(|world| std::cmp::Reverse(world.modified));
     Ok(worlds)
 }
 

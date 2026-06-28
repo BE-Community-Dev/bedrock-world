@@ -2183,11 +2183,9 @@ mod tests {
             bytes.push(y as u8);
         }
         bytes.push(bits_per_block << 1);
-        let values_per_word = if bits_per_block == 0 {
-            4096
-        } else {
-            usize::from(32 / bits_per_block)
-        };
+        let values_per_word = 32_usize
+            .checked_div(usize::from(bits_per_block))
+            .unwrap_or(4096);
         let mut words = vec![0_u32; packed_word_count(bits_per_block)];
         if bits_per_block != 0 {
             for block_index in 0..4096 {

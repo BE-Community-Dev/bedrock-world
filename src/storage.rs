@@ -356,6 +356,10 @@ pub trait WorldStorage: Send + Sync {
     fn write_batch(&self, batch: &StorageBatch) -> Result<()>;
     /// Flushes pending writes to durable storage when supported by the backend.
     fn flush(&self) -> Result<()>;
+    /// Rewrites visible storage data to remove obsolete delete markers and old tables.
+    fn compact(&self) -> Result<()> {
+        self.flush()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -495,6 +499,10 @@ impl WorldStorage for MemoryStorage {
     }
 
     fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn compact(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -650,6 +658,10 @@ impl WorldStorage for PocketChunksDatStorage {
     fn flush(&self) -> Result<()> {
         Ok(())
     }
+
+    fn compact(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn parse_pocket_chunks_dat(
@@ -803,7 +815,7 @@ pub mod backend {
                 paranoid_checks: true,
                 compression_policy: bedrock_leveldb::CompressionPolicy::Zlib,
                 cache_size: 64 * 1024 * 1024,
-                write_buffer_size: 4 * 1024 * 1024,
+                write_buffer_size: 0,
             };
             let db = bedrock_leveldb::Db::open(path, options).map_err(map_leveldb_error)?;
             Ok(Self { db: Arc::new(db) })
@@ -841,17 +853,14 @@ pub mod backend {
                 .put(
                     Bytes::copy_from_slice(key),
                     Bytes::copy_from_slice(value),
-                    bedrock_leveldb::WriteOptions::default(),
+                    write_options(),
                 )
                 .map_err(map_leveldb_error)
         }
 
         fn delete(&self, key: &[u8]) -> Result<()> {
             self.db
-                .delete(
-                    Bytes::copy_from_slice(key),
-                    bedrock_leveldb::WriteOptions::default(),
-                )
+                .delete(Bytes::copy_from_slice(key), write_options())
                 .map_err(map_leveldb_error)
         }
 
@@ -977,13 +986,22 @@ pub mod backend {
                 }
             }
             self.db
-                .write(db_batch, bedrock_leveldb::WriteOptions::default())
+                .write(db_batch, write_options())
                 .map_err(map_leveldb_error)
         }
 
         fn flush(&self) -> Result<()> {
-            self.db.flush().map_err(map_leveldb_error)
+            Ok(())
         }
+
+        fn compact(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "backend-bedrock-leveldb")]
+    const fn write_options() -> bedrock_leveldb::WriteOptions {
+        bedrock_leveldb::WriteOptions { sync: true }
     }
 
     #[cfg(feature = "backend-bedrock-leveldb")]
@@ -1126,6 +1144,12 @@ pub mod backend {
                 "backend-bedrock-leveldb feature is disabled".to_string(),
             ))
         }
+
+        fn compact(&self) -> Result<()> {
+            Err(BedrockWorldError::LevelDb(
+                "backend-bedrock-leveldb feature is disabled".to_string(),
+            ))
+        }
     }
 }
 
@@ -1199,6 +1223,17 @@ mod tests {
         storage.put(b"player_1", b"one").expect("put");
         storage.put(b"player_2", b"two").expect("put");
         storage.flush().expect("flush");
+        let table_count = std::fs::read_dir(&path)
+            .expect("read dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "ldb")
+            })
+            .count();
+        assert_eq!(table_count, 0);
 
         let reopened = backend::BedrockLevelDbStorage::open(&path).expect("reopen");
         assert_eq!(

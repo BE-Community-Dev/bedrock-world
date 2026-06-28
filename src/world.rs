@@ -765,8 +765,7 @@ impl WorldThreadingOptions {
             Self::Single => 1,
             Self::Fixed(threads) => threads.clamp(1, MAX_WORLD_THREADS),
             Self::Auto => std::thread::available_parallelism()
-                .map(usize::from)
-                .unwrap_or(1)
+                .map_or(1, usize::from)
                 .min(work_items.max(1)),
         }
     }
@@ -1020,6 +1019,12 @@ where
     pub fn write_level_dat_blocking(&self, document: &LevelDatDocument) -> Result<()> {
         self.ensure_writable()?;
         write_level_dat_document(&self.path.join("level.dat"), document)
+    }
+
+    /// Compact the underlying world storage after writes.
+    pub fn compact_storage_blocking(&self) -> Result<()> {
+        self.ensure_writable()?;
+        self.storage().compact()
     }
 
     /// List players blocking.
@@ -3392,8 +3397,7 @@ where
             return Err(BedrockWorldError::ReadOnly);
         }
         validate_batch(&self.batch)?;
-        self.storage.storage().write_batch(&self.batch)?;
-        self.storage.storage().flush()
+        self.storage.storage().write_batch(&self.batch)
     }
 
     fn replace_actor_digest<F>(&mut self, pos: ChunkPos, update: F) -> Result<()>
@@ -4534,8 +4538,7 @@ mod tests {
     #[test]
     fn world_threading_validates_fixed_range_and_auto_is_not_capped_to_eight() {
         let expected_auto = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
+            .map_or(1, usize::from)
             .min(10_000);
         assert_eq!(
             WorldThreadingOptions::Auto
