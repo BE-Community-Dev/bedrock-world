@@ -11,6 +11,7 @@ use crate::{
     ActorDigestKey, BlockPos, CancelFlag, Chunk, ChunkKey, ChunkPos, ChunkRecord, ChunkRecordTag,
     Dimension, StorageReadOptions, SurfaceColumn, WorldChunkQueryRegion,
 };
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::path::PathBuf;
@@ -678,25 +679,7 @@ where
             })
             .collect());
     }
-    let mut keys = Vec::with_capacity(
-        positions
-            .len()
-            .saturating_mul(tags.len().saturating_add(usize::from(query.entities))),
-    );
-    let mut owners = Vec::with_capacity(keys.capacity());
-    for (chunk_index, pos) in positions.iter().copied().enumerate() {
-        for tag in &tags {
-            keys.push(ChunkKey::new(pos, *tag).encode());
-            owners.push(BatchedRecordOwner::ChunkRecord {
-                chunk_index,
-                tag: *tag,
-            });
-        }
-        if query.entities {
-            keys.push(ActorDigestKey::new(pos).storage_key());
-            owners.push(BatchedRecordOwner::ActorDigest { chunk_index });
-        }
-    }
+    let (keys, owners) = fingerprint_record_requests(&positions, &tags, query.entities);
     let values = world
         .storage()
         .get_many_ordered_with_control(&keys, record_query_read_options(cancel))?;
@@ -704,14 +687,14 @@ where
     for ((owner, key), value) in owners.into_iter().zip(keys).zip(values) {
         match owner {
             BatchedRecordOwner::ChunkRecord { chunk_index, tag } => {
-                hashers
-                    .get_mut(chunk_index)
-                    .map(|hasher| hash_record(hasher, &key, value.as_deref(), Some(tag)));
+                if let Some(hasher) = hashers.get_mut(chunk_index) {
+                    hash_record(hasher, &key, value.as_deref(), Some(tag));
+                }
             }
             BatchedRecordOwner::ActorDigest { chunk_index } => {
-                hashers
-                    .get_mut(chunk_index)
-                    .map(|hasher| hash_record(hasher, &key, value.as_deref(), None));
+                if let Some(hasher) = hashers.get_mut(chunk_index) {
+                    hash_record(hasher, &key, value.as_deref(), None);
+                }
                 if let Some(value) = value {
                     if let Some(actor_ids) = actor_ids_by_chunk.get_mut(chunk_index) {
                         actor_ids.extend(parse_actor_digest_ids(&value)?);
@@ -758,6 +741,32 @@ where
             value: hasher.digest128(),
         })
         .collect())
+}
+
+fn fingerprint_record_requests(
+    positions: &[ChunkPos],
+    tags: &[ChunkRecordTag],
+    include_entities: bool,
+) -> (Vec<Bytes>, Vec<BatchedRecordOwner>) {
+    let capacity = positions
+        .len()
+        .saturating_mul(tags.len().saturating_add(usize::from(include_entities)));
+    let mut keys = Vec::with_capacity(capacity);
+    let mut owners = Vec::with_capacity(capacity);
+    for (chunk_index, pos) in positions.iter().copied().enumerate() {
+        for tag in tags {
+            keys.push(ChunkKey::new(pos, *tag).encode());
+            owners.push(BatchedRecordOwner::ChunkRecord {
+                chunk_index,
+                tag: *tag,
+            });
+        }
+        if include_entities {
+            keys.push(ActorDigestKey::new(pos).storage_key());
+            owners.push(BatchedRecordOwner::ActorDigest { chunk_index });
+        }
+    }
+    (keys, owners)
 }
 
 fn hash_record(hasher: &mut Xxh3, key: &[u8], value: Option<&[u8]>, tag: Option<ChunkRecordTag>) {

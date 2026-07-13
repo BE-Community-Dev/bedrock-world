@@ -4484,7 +4484,7 @@ fn render_chunk_from_raw(
         .map(render_biome_colors_from_legacy_terrain);
     let mut render_biomes = BTreeMap::new();
     let data_request = &options.data_request;
-    insert_render_biome_storages(&mut render_biomes, biome_data, &data_request);
+    insert_render_biome_storages(&mut render_biomes, biome_data, data_request);
     timing.biome_parse_us = biome_started.elapsed().as_micros();
 
     let mut subchunks = BTreeMap::new();

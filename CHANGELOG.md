@@ -2,6 +2,13 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## 0.3.2 - 2026-07-14
+
+### Fixed
+
+- Fixed Clippy findings in chunk-record fingerprinting and biome request
+  handling that blocked the `0.3.1` publish workflow.
+
 ## 0.3.1 - 2026-07-14
 
 ### Changed
