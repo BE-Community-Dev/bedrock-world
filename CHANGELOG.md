@@ -2,6 +2,13 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## 0.3.1 - 2026-07-14
+
+### Changed
+
+- Updated the optional `bedrock-leveldb` backend dependency to `0.3.1` after
+  the `0.3.0` release workflow was blocked before publication.
+
 ## 0.3.0 - 2026-07-14
 
 ### Added
