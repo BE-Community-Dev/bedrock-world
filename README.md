@@ -76,8 +76,8 @@ This crate focuses on complete parsing behavior. The
 - Render-specific APIs now have their own fast path:
   `list_render_chunk_positions_blocking`,
   `list_render_chunk_positions_in_region_blocking`,
-  `load_render_chunk_blocking`, `load_render_chunks_blocking`, and
-  `load_render_region_blocking`. These only read records needed to render
+  `query_chunk_data_blocking`, `query_chunk_data_many_blocking`, and
+  `query_chunk_region_blocking`. These only read records needed to render
   chunks and can run with bounded parallelism.
 - Render chunk data now carries `legacy_terrain: Option<LegacyTerrain>`,
   structured `legacy_biomes`, and compatibility `legacy_biome_colors`.
@@ -88,10 +88,10 @@ This crate focuses on complete parsing behavior. The
   `LegacyTerrain` records
   are requested through exact batch reads, so 0.16-era LevelDB worlds do not
   need `Data2D` or `SubChunkPrefix` to be considered renderable.
-- `RenderChunkLoadOptions::request` selects one render load contract:
+- `ChunkLoadOptions::request` selects one render load contract:
   `ExactSurface` computes canonical top-down surface columns, `RawHeightMap`
   loads only raw height records for diagnostics, and `Layer`/`Biome` load fixed
-  slices. `ExactSurface` exposes `RenderChunkData::column_samples` with the
+  slices. `ExactSurface` exposes `ChunkData::column_samples` with the
   real visual surface block, relief/support block, optional thin overlay, water
   context, biome sample, and source for every sampled X/Z column.
 - Transition chunks that contain both `LegacyTerrain` and `SubChunkPrefix`
@@ -156,25 +156,25 @@ keeps counts and structured summaries while avoiding raw value retention.
   scans and skips chunks that have no render records.
 - For interactive tile rendering, `load_render_chunks_with_stats_blocking` uses
   exact `get_many` requests for `LegacyTerrain`, biome records, subchunks, and
-  block entities. `RenderLoadStats::prefix_scans` should remain `0` on this
+  block entities. `ChunkLoadStats::prefix_scans` should remain `0` on this
   exact path; `legacy_terrain_records`, `legacy_biome_samples`,
   `legacy_biome_colors`,
   `terrain_source_legacy`, `terrain_source_subchunk`, `legacy_pocket_chunks`,
   and `detected_format` identify old-world and transition-world loads.
 - Exact render chunk batches preserve the association between every requested
   `ChunkPos` and its records even when the input is shuffled, duplicated, or
-  resorted by `RenderChunkPriority`. If a renderer shows chunk-level visual
+  resorted by `ChunkLoadPriority`. If a renderer shows chunk-level visual
   scrambling, compare these exact-batch stats with renderer placement
   diagnostics before changing parser coordinate formulas.
 - Chunk parsing uses prefix scans and the LevelDB native block cache; repeated
   sample chunk reads avoid full table scans.
 - Default world scans use automatic bounded parallel table scanning. Use
   `WorldThreadingOptions::Single` for deterministic debugging.
-- `RenderChunkLoadOptions::threading` and `RenderRegionLoadOptions::threading`
+- `ChunkLoadOptions::threading` and `WorldChunkQueryRegionLoadOptions::threading`
   control parallel render chunk loading. Use `Single` when an outer renderer
   already owns the worker pool to avoid nested oversubscription.
-- `RenderChunkLoadOptions::priority` can use
-  `RenderChunkPriority::DistanceFrom { chunk_x, chunk_z }` so the current
+- `ChunkLoadOptions::priority` can use
+  `ChunkLoadPriority::DistanceFrom { chunk_x, chunk_z }` so the current
   viewport center loads first. `RenderRegionData::stats` reports requested and
   loaded chunks, decoded subchunks, worker count, queue wait, and total load
   time.
@@ -228,7 +228,7 @@ Prefer a render-only region query for the current viewport:
 
 ```rust
 let visible = world.list_render_chunk_positions_in_region_blocking(
-    bedrock_world::RenderChunkRegion {
+    bedrock_world::WorldChunkQueryRegion {
         dimension,
         min_chunk_x,
         min_chunk_z,
@@ -247,15 +247,15 @@ let visible = world.list_render_chunk_positions_in_region_blocking(
 Then load just those chunks for the tile or viewport batch:
 
 ```rust
-let chunks = world.load_render_chunks_blocking(
+let chunks = world.query_chunk_data_many_blocking(
     visible,
-    bedrock_world::RenderChunkLoadOptions {
+    bedrock_world::ChunkLoadOptions {
         threading: WorldThreadingOptions::Fixed(4),
-        priority: bedrock_world::RenderChunkPriority::DistanceFrom {
+        priority: bedrock_world::ChunkLoadPriority::DistanceFrom {
             chunk_x: viewport_center_x,
             chunk_z: viewport_center_z,
         },
-        ..bedrock_world::RenderChunkLoadOptions::default()
+        ..bedrock_world::ChunkLoadOptions::default()
     },
 )?;
 ```
@@ -343,7 +343,7 @@ outside this crate's current scope.
   safe `level.dat` edits.
 - Use category APIs when only one class of data is required. This avoids parsing
   entities, chunks, and global records unnecessarily.
-- For renderers, build a viewport `RenderChunkRegion` first and use the
+- For renderers, build a viewport `WorldChunkQueryRegion` first and use the
   render-index APIs. Keep full `list_chunk_positions_blocking` for metadata,
   search, and offline export workflows.
 - After large write waves, call `compact_storage_blocking` explicitly if the

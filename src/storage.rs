@@ -60,6 +60,8 @@ pub struct StorageReadOptions {
     pub threading: StorageThreadingOptions,
     /// Scan strategy requested from the backend.
     pub scan_mode: StorageScanMode,
+    /// Backend cache strategy for table/data blocks.
+    pub cache_policy: StorageCachePolicy,
     /// Bounded pipeline settings for this operation.
     pub pipeline: StoragePipelineOptions,
     /// Optional cancellation flag checked during long-running work.
@@ -73,11 +75,22 @@ impl Default for StorageReadOptions {
         Self {
             threading: StorageThreadingOptions::Auto,
             scan_mode: StorageScanMode::ParallelTables,
+            cache_policy: StorageCachePolicy::Bypass,
             pipeline: StoragePipelineOptions::default(),
             cancel: None,
             progress: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Cache policy for backend storage reads.
+pub enum StorageCachePolicy {
+    #[default]
+    /// Bypass shared backend block caches.
+    Bypass,
+    /// Use shared backend block caches when available.
+    Use,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -792,15 +805,27 @@ pub mod backend {
     impl BedrockLevelDbStorage {
         /// Opens a `LevelDB` directory for read/write access.
         pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-            Self::open_inner(path, false)
+            Self::open_inner(path, false, true)
         }
 
         /// Opens a `LevelDB` directory without allowing backend writes.
         pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-            Self::open_inner(path, true)
+            Self::open_inner(path, true, true)
         }
 
-        fn open_inner(path: impl AsRef<Path>, read_only: bool) -> Result<Self> {
+        /// Opens a read-only database while allowing table blocks with invalid checksums.
+        ///
+        /// This is intended for best-effort inspection of damaged worlds. The returned
+        /// storage never writes to the database.
+        pub fn open_read_only_best_effort(path: impl AsRef<Path>) -> Result<Self> {
+            Self::open_inner(path, true, false)
+        }
+
+        fn open_inner(
+            path: impl AsRef<Path>,
+            read_only: bool,
+            paranoid_checks: bool,
+        ) -> Result<Self> {
             let path = path.as_ref().to_path_buf();
             if !path.exists() {
                 return Err(BedrockWorldError::Io(std::io::Error::new(
@@ -812,7 +837,7 @@ pub mod backend {
                 read_only,
                 create_if_missing: false,
                 error_if_exists: false,
-                paranoid_checks: true,
+                paranoid_checks,
                 compression_policy: bedrock_leveldb::CompressionPolicy::Zlib,
                 cache_size: 64 * 1024 * 1024,
                 write_buffer_size: 0,
@@ -1019,7 +1044,10 @@ pub mod backend {
     fn to_leveldb_read_options(options: StorageReadOptions) -> bedrock_leveldb::ReadOptions {
         bedrock_leveldb::ReadOptions {
             checksum: bedrock_leveldb::ChecksumMode::Inherit,
-            cache_policy: bedrock_leveldb::CachePolicy::Bypass,
+            cache_policy: match options.cache_policy {
+                StorageCachePolicy::Bypass => bedrock_leveldb::CachePolicy::Bypass,
+                StorageCachePolicy::Use => bedrock_leveldb::CachePolicy::Use,
+            },
             read_strategy: bedrock_leveldb::ReadStrategy::Shared,
             threading: match options.threading {
                 StorageThreadingOptions::Auto => bedrock_leveldb::ThreadingOptions::Auto,
@@ -1080,6 +1108,13 @@ pub mod backend {
 
         /// Returns an error because the LevelDB backend feature is disabled.
         pub fn open_read_only(_path: impl AsRef<Path>) -> Result<Self> {
+            Err(BedrockWorldError::LevelDb(
+                "backend-bedrock-leveldb feature is disabled".to_string(),
+            ))
+        }
+
+        /// Returns an error because the LevelDB backend feature is disabled.
+        pub fn open_read_only_best_effort(_path: impl AsRef<Path>) -> Result<Self> {
             Err(BedrockWorldError::LevelDb(
                 "backend-bedrock-leveldb feature is disabled".to_string(),
             ))

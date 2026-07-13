@@ -46,6 +46,7 @@ pub mod level_dat;
 pub mod mcstructure;
 /// Little-endian Bedrock NBT reader and writer.
 pub mod nbt;
+mod nbt_ref;
 /// Structured parsers for world, chunk, entity, biome, map, and village data.
 pub mod parsed;
 /// Player identifiers and raw player record helpers.
@@ -54,6 +55,8 @@ pub mod player;
 pub mod query;
 /// Storage abstraction and LevelDB backend adapters.
 pub mod storage;
+/// Terrain surface role helpers shared by chunk decoding and render sampling.
+pub mod surface;
 /// High-level lazy world handle and scan/render helpers.
 pub mod world;
 
@@ -89,28 +92,32 @@ pub use parsed::{
 };
 pub use player::{PlayerData, PlayerId};
 pub use query::{
-    BlockEntityOverlay, BlockTip, ChunkDetail, ChunkRecordDetail, EntityOverlay,
-    HardcodedSpawnAreaOverlay, RegionOverlayQuery, RegionOverlayQueryOptions, SelectionStats,
+    BlockEntityOverlay, BlockTip, ChunkDetail, ChunkRecordDetail, ChunkRecordFingerprint,
+    ChunkRecordQuery, ChunkRecordQueryResult, EntityOverlay, HardcodedSpawnAreaOverlay,
+    PendingTickOverlay, RegionOverlayQuery, RegionOverlayQueryOptions, SelectionStats,
     SlimeChunkBounds, SlimeChunkWindow, SlimeWindowSize, VillageOverlay, VillageOverlayIndex,
-    WriteGuard, delete_chunks_blocking, is_bedrock_slime_chunk, is_slime_chunk,
-    query_block_tip_blocking, query_chunk_detail_blocking, query_region_overlays_blocking,
+    WriteGuard, delete_chunks_blocking, fingerprint_chunk_records_many_blocking,
+    fingerprint_chunk_records_many_blocking_with_control, is_bedrock_slime_chunk, is_slime_chunk,
+    query_block_tip_blocking, query_chunk_detail_blocking, query_chunk_records_many_blocking,
+    query_chunk_records_many_blocking_with_control, query_region_overlays_blocking,
     query_region_overlays_blocking_with_control, query_selection_stats_blocking,
     query_slime_chunk_windows, write_chunk_record_nbt_blocking,
 };
 pub use storage::{
     MemoryStorage, POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN, PocketChunksDatStorage, StorageBatch,
-    StorageCancelFlag, StorageEntry, StorageEntryRef, StorageOp, StoragePipelineOptions,
-    StorageProgressSink, StorageReadOptions, StorageScanMode, StorageScanOutcome,
-    StorageScanProgress, StorageThreadingOptions, StorageVisitorControl, WorldStorage,
-    backend::BedrockLevelDbStorage,
+    StorageCachePolicy, StorageCancelFlag, StorageEntry, StorageEntryRef, StorageOp,
+    StoragePipelineOptions, StorageProgressSink, StorageReadOptions, StorageScanMode,
+    StorageScanOutcome, StorageScanProgress, StorageThreadingOptions, StorageVisitorControl,
+    WorldStorage, backend::BedrockLevelDbStorage,
 };
 pub use world::{
-    BedrockWorld, CancelFlag, ChunkBounds, ExactSurfaceBiomeLoad, ExactSurfaceSubchunkPolicy,
-    OpenOptions, ProgressSink, RenderBlockEntity, RenderChunkData, RenderChunkLoadOptions,
-    RenderChunkPriority, RenderChunkRegion, RenderChunkRequest, RenderLoadStats, RenderRegionData,
-    RenderRegionLoadOptions, SurfaceColumn, SurfaceColumnOptions, TerrainColumnBiome,
-    TerrainColumnOverlay, TerrainColumnSample, TerrainColumnSamples, TerrainColumnWater,
-    TerrainSampleSource, TerrainSurfaceRole, WorldFormat, WorldFormatHint, WorldPipelineOptions,
-    WorldScanOptions, WorldScanProgress, WorldStorageHandle, WorldThreadingOptions,
-    WorldTransaction, terrain_surface_overlay_alpha, terrain_surface_role,
+    BedrockWorld, BiomeDataRequirement, CancelFlag, ChunkBlockEntity, ChunkBounds, ChunkData,
+    ChunkDataRequest, ChunkLoadOptions, ChunkLoadPriority, ChunkLoadStats, ExactSurfaceBiomeLoad,
+    ExactSurfaceSubchunkPolicy, OpenOptions, ProgressSink, SubchunkDataRequirement, SurfaceColumn,
+    SurfaceColumnOptions, TerrainColumnBiome, TerrainColumnOverlay, TerrainColumnSample,
+    TerrainColumnSamples, TerrainColumnWater, TerrainSampleSource, TerrainSurfaceRole,
+    WorldChunkQueryRegion, WorldChunkQueryRegionData, WorldChunkQueryRegionLoadOptions,
+    WorldFormat, WorldFormatHint, WorldPipelineOptions, WorldScanOptions, WorldScanProgress,
+    WorldStorageHandle, WorldThreadingOptions, WorldTransaction, terrain_surface_overlay_alpha,
+    terrain_surface_role,
 };

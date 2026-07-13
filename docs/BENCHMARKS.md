@@ -65,3 +65,19 @@ large_fixture.sample_chunk elapsed_ms=72 records=17 subchunks=9 block_entities=0
 large_fixture.render_exact_batch.generic elapsed_ms=37 chunks=4 worker_threads=1 prefix_scans=0 exact_get_batches=1 keys_requested=112 keys_found=39
 large_fixture.nbt_events.level_dat elapsed_ms=0 events=147 payload_len=2889
 ```
+
+### Chunk Query Fast Path
+
+Local run on 2026-07-13 against the same fixture, after removing unnecessary
+`LegacyTerrain` reads from fixed-layer/cave queries and enabling storage-block
+cache reuse by default:
+
+| Query | Chunks | Keys | DB | Decode | Elapsed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Exact surface, cache reuse warm | 256 | 7168 | 44 ms | 272 ms | 319 ms |
+| Fixed layer, cache reuse | 256 | 256 | 4 ms | 4 ms | 8 ms |
+
+The fixed-layer result is cache-sensitive. Use `StorageCachePolicy::Bypass` for
+cold-read measurements; the equivalent cold pass was 41 ms with 36 ms in DB
+reads. Exact surface is decode-bound and should be optimized in the packed
+surface-column parser rather than by adding DB concurrency.

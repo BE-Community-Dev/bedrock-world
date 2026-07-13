@@ -920,11 +920,13 @@ impl EntrySubchunkBuilder {
 }
 
 fn block_palette_contains_non_air(palette: &BlockPalette) -> bool {
-    palette
-        .states
-        .iter()
-        .zip(palette.counts.iter())
-        .any(|(state, count)| *count > 0 && state.name != AIR_BLOCK_NAME)
+    palette.counts.as_ref().is_some_and(|counts| {
+        palette
+            .states
+            .iter()
+            .zip(counts)
+            .any(|(state, count)| *count > 0 && state.name != AIR_BLOCK_NAME)
+    })
 }
 
 fn fill_entries_from_palette(
@@ -1115,6 +1117,7 @@ fn transform_palette_entry(
         return entry;
     }
 
+    let is_trapdoor = is_trapdoor_block_name(&entry.name);
     transform_direction_string_state(&mut entry.states, "minecraft:cardinal_direction", placement);
     transform_direction_string_state(&mut entry.states, "cardinal_direction", placement);
     transform_direction_string_state(&mut entry.states, "facing", placement);
@@ -1126,8 +1129,13 @@ fn transform_palette_entry(
 
     transform_facing_direction_state(&mut entry.states, "facing_direction", placement);
     transform_facing_direction_state(&mut entry.states, "minecraft:facing_direction", placement);
-    transform_cardinal_direction_state(&mut entry.states, "direction", placement);
-    transform_cardinal_direction_state(&mut entry.states, "minecraft:direction", placement);
+    if is_trapdoor {
+        transform_trapdoor_direction_state(&mut entry.states, "direction", placement);
+        transform_trapdoor_direction_state(&mut entry.states, "minecraft:direction", placement);
+    } else {
+        transform_cardinal_direction_state(&mut entry.states, "direction", placement);
+        transform_cardinal_direction_state(&mut entry.states, "minecraft:direction", placement);
+    }
     transform_cardinal_direction_state(&mut entry.states, "weirdo_direction", placement);
     transform_cardinal_direction_state(&mut entry.states, "minecraft:weirdo_direction", placement);
     transform_sixteen_way_direction_state(&mut entry.states, "ground_sign_direction", placement);
@@ -1188,6 +1196,11 @@ fn transform_palette_entry(
     transform_left_right_shape_state(&mut entry.states, "minecraft:shape", placement);
 
     entry
+}
+
+fn is_trapdoor_block_name(name: &str) -> bool {
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    name == "trapdoor" || name.ends_with("_trapdoor")
 }
 
 const fn placement_changes_horizontal_state(placement: McStructurePlacement) -> bool {
@@ -1298,6 +1311,25 @@ impl HorizontalDirection {
             Self::East => 5,
         }
     }
+
+    const fn from_trapdoor_direction_int(value: i32) -> Option<Self> {
+        match value.rem_euclid(4) {
+            0 => Some(Self::West),
+            1 => Some(Self::East),
+            2 => Some(Self::North),
+            3 => Some(Self::South),
+            _ => None,
+        }
+    }
+
+    const fn to_trapdoor_direction_int(self) -> i32 {
+        match self {
+            Self::West => 0,
+            Self::East => 1,
+            Self::North => 2,
+            Self::South => 3,
+        }
+    }
 }
 
 fn transform_direction_string_state(
@@ -1342,6 +1374,25 @@ fn transform_cardinal_direction_state(
         return;
     };
     set_nbt_i32_value(value, direction.transform(placement).to_cardinal_int());
+}
+
+fn transform_trapdoor_direction_state(
+    states: &mut BTreeMap<String, NbtTag>,
+    key: &str,
+    placement: McStructurePlacement,
+) {
+    let Some(value) = states.get_mut(key) else {
+        return;
+    };
+    let Some(direction) =
+        nbt_i32_value(value).and_then(HorizontalDirection::from_trapdoor_direction_int)
+    else {
+        return;
+    };
+    set_nbt_i32_value(
+        value,
+        direction.transform(placement).to_trapdoor_direction_int(),
+    );
 }
 
 fn transform_sixteen_way_direction_state(
@@ -1779,6 +1830,52 @@ mod tests {
         assert_eq!(
             block_placement.primary.states.get("facing_direction"),
             Some(&NbtTag::Byte(5))
+        );
+    }
+
+    #[test]
+    fn mcstructure_block_placement_transforms_trapdoor_direction_state() {
+        let size = McStructureSize::new(1, 1, 1).expect("valid size");
+        let mut structure = McStructureFile::new_air(size, [0, 64, 0]).expect("air structure");
+        structure.palette.push(McStructurePaletteEntry {
+            name: "minecraft:oak_trapdoor".to_string(),
+            states: BTreeMap::from([("direction".to_string(), NbtTag::Byte(0))]),
+            version: Some(1),
+        });
+        structure.primary_indices[0] = 1;
+        let placement = McStructurePlacement {
+            source_anchor: ChunkPos {
+                x: 0,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            target_anchor: ChunkPos {
+                x: 0,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            origin_y: 64,
+            rotation: McStructureRotation::None,
+            mirror_x: true,
+            mirror_z: false,
+        };
+
+        let block_placement = structure
+            .structure_block_placement(
+                &McStructureBlock {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    primary: 1,
+                    secondary: -1,
+                },
+                placement,
+            )
+            .expect("block placement");
+
+        assert_eq!(
+            block_placement.primary.states.get("direction"),
+            Some(&NbtTag::Byte(1))
         );
     }
 

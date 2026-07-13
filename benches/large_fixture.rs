@@ -1,6 +1,6 @@
 use bedrock_world::{
-    BedrockLevelDbStorage, BedrockWorld, ChunkPos, Dimension, ExactSurfaceBiomeLoad,
-    ExactSurfaceSubchunkPolicy, NbtView, OpenOptions, RenderChunkLoadOptions, RenderChunkRequest,
+    BedrockLevelDbStorage, BedrockWorld, BiomeDataRequirement, ChunkDataRequest, ChunkLoadOptions,
+    ChunkPos, Dimension, ExactSurfaceSubchunkPolicy, NbtView, OpenOptions, StorageCachePolicy,
     StorageReadOptions, StorageScanMode, StorageThreadingOptions, StorageVisitorControl,
     WorldScanOptions, WorldStorage, WorldThreadingOptions, read_level_dat_document,
 };
@@ -149,46 +149,73 @@ fn main() {
         chunk.report.parse_errors.len()
     );
 
-    let render_positions = vec![
-        pos,
-        ChunkPos {
-            x: pos.x + 1,
-            ..pos
-        },
-        ChunkPos {
-            z: pos.z + 1,
-            ..pos
-        },
-        ChunkPos {
-            x: pos.x + 1,
-            z: pos.z + 1,
-            ..pos
-        },
-    ];
+    let render_positions = render_tile_positions(pos, 16);
+    for (cache_label, storage_cache_policy) in [
+        ("bypass", StorageCachePolicy::Bypass),
+        ("use", StorageCachePolicy::Use),
+    ] {
+        for pass in ["cold", "warm"] {
+            let start = Instant::now();
+            let (chunks, render_stats) = generic_world
+                .query_chunk_data_with_stats_blocking(
+                    render_positions.clone(),
+                    ChunkLoadOptions {
+                        data_request: ChunkDataRequest::new()
+                            .surface_columns(ExactSurfaceSubchunkPolicy::Full)
+                            .biome(BiomeDataRequirement::SurfaceColumns),
+                        threading: WorldThreadingOptions::Single,
+                        storage_cache_policy,
+                        ..ChunkLoadOptions::default()
+                    },
+                )
+                .expect("render exact batch");
+            println!(
+                "large_fixture.render_exact_batch.generic cache_policy={} pass={} elapsed_ms={} chunks={} worker_threads={} prefix_scans={} exact_get_batches={} keys_requested={} keys_found={} db_read_ms={} decode_ms={} biome_parse_us={} subchunk_parse_us={} surface_scan_us={} block_entity_parse_us={}",
+                cache_label,
+                pass,
+                start.elapsed().as_millis(),
+                chunks.len(),
+                render_stats.worker_threads,
+                render_stats.prefix_scans,
+                render_stats.exact_get_batches,
+                render_stats.keys_requested,
+                render_stats.keys_found,
+                render_stats.db_read_ms,
+                render_stats.decode_ms,
+                render_stats.biome_parse_us,
+                render_stats.subchunk_parse_us,
+                render_stats.surface_scan_us,
+                render_stats.block_entity_parse_us
+            );
+        }
+    }
+
     let start = Instant::now();
-    let (chunks, render_stats) = generic_world
-        .load_render_chunks_with_stats_blocking(
+    let (chunks, layer_stats) = generic_world
+        .query_chunk_data_with_stats_blocking(
             render_positions,
-            RenderChunkLoadOptions {
-                request: RenderChunkRequest::ExactSurface {
-                    subchunks: ExactSurfaceSubchunkPolicy::Full,
-                    biome: ExactSurfaceBiomeLoad::TopColumns,
-                    block_entities: false,
-                },
+            ChunkLoadOptions {
+                data_request: ChunkDataRequest::new().layer(64),
                 threading: WorldThreadingOptions::Single,
-                ..RenderChunkLoadOptions::default()
+                storage_cache_policy: StorageCachePolicy::Use,
+                ..ChunkLoadOptions::default()
             },
         )
-        .expect("render exact batch");
+        .expect("query fixed layer batch");
     println!(
-        "large_fixture.render_exact_batch.generic elapsed_ms={} chunks={} worker_threads={} prefix_scans={} exact_get_batches={} keys_requested={} keys_found={}",
+        "large_fixture.chunk_layer_batch.generic elapsed_ms={} chunks={} worker_threads={} exact_get_batches={} keys_requested={} keys_found={} db_read_ms={} decode_ms={} biome_parse_us={} subchunk_parse_us={} surface_scan_us={} block_entity_parse_us={}",
         start.elapsed().as_millis(),
         chunks.len(),
-        render_stats.worker_threads,
-        render_stats.prefix_scans,
-        render_stats.exact_get_batches,
-        render_stats.keys_requested,
-        render_stats.keys_found
+        layer_stats.worker_threads,
+        layer_stats.exact_get_batches,
+        layer_stats.keys_requested,
+        layer_stats.keys_found,
+        layer_stats.db_read_ms,
+        layer_stats.decode_ms,
+        layer_stats.biome_parse_us,
+        layer_stats.subchunk_parse_us,
+        layer_stats.surface_scan_us,
+        layer_stats.block_entity_parse_us
     );
 
     let level_bytes = std::fs::read(world_path.join("level.dat")).expect("read level.dat raw");
@@ -208,4 +235,16 @@ fn main() {
         events.len(),
         payload_end.saturating_sub(8)
     );
+}
+
+fn render_tile_positions(origin: ChunkPos, size: i32) -> Vec<ChunkPos> {
+    (0..size)
+        .flat_map(|z_offset| {
+            (0..size).map(move |x_offset| ChunkPos {
+                x: origin.x + x_offset,
+                z: origin.z + z_offset,
+                dimension: origin.dimension,
+            })
+        })
+        .collect()
 }

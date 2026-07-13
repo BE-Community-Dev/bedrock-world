@@ -7,6 +7,7 @@
 
 use crate::error::{BedrockWorldError, Result};
 use crate::nbt::{NbtTag, parse_consecutive_root_nbt, parse_root_nbt_with_consumed};
+use crate::surface::is_air_block_name;
 use bytes::Bytes;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -795,21 +796,74 @@ pub struct BlockPalette {
     pub states: Vec<BlockState>,
     /// Optional unpacked palette indices in Bedrock storage order.
     pub indices: Option<Vec<u16>>,
-    /// Per-palette-entry usage counts collected while decoding.
-    pub counts: Vec<u16>,
+    /// Packed palette indices retained for exact surface-column sampling.
+    packed_indices: Option<PackedPaletteIndices>,
+    /// Per-palette-entry usage counts when the decode request needs them.
+    pub counts: Option<Vec<u16>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PackedPaletteIndices {
+    bytes: Bytes,
+    bits_per_block: u8,
+    palette_len: usize,
+}
+
+impl PackedPaletteIndices {
+    fn get(&self, index: usize) -> Option<u16> {
+        if index >= 4096 {
+            return None;
+        }
+        if self.bits_per_block == 0 {
+            return Some(0);
+        }
+        let values_per_word = usize::from(32 / self.bits_per_block);
+        let word_index = index / values_per_word;
+        let item_index = index % values_per_word;
+        let byte_offset = word_index.checked_mul(4)?;
+        let word_bytes: [u8; 4] = self
+            .bytes
+            .get(byte_offset..byte_offset + 4)?
+            .try_into()
+            .ok()?;
+        let word = u32::from_le_bytes(word_bytes);
+        let mask = (1_u32 << self.bits_per_block) - 1;
+        let value = ((word >> (item_index * usize::from(self.bits_per_block))) & mask) as u16;
+        (usize::from(value) < self.palette_len).then_some(value)
+    }
 }
 
 impl BlockPalette {
+    #[must_use]
+    /// Creates a palette backed by already unpacked block indices.
+    ///
+    /// This is intended for callers that construct decoded subchunks, including
+    /// tests and format adapters. Normal storage decoding retains a packed
+    /// representation when unpacking is unnecessary.
+    pub fn with_unpacked_indices(
+        states: Vec<BlockState>,
+        indices: Vec<u16>,
+        counts: Option<Vec<u16>>,
+    ) -> Self {
+        Self {
+            states,
+            indices: Some(indices),
+            packed_indices: None,
+            counts,
+        }
+    }
+
     #[must_use]
     /// Returns the decoded palette index at local subchunk coordinates.
     pub fn palette_index_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u16> {
         if local_x >= 16 || local_y >= 16 || local_z >= 16 {
             return None;
         }
+        let index = block_storage_index(local_x, local_y, local_z);
         self.indices
-            .as_ref()?
-            .get(block_storage_index(local_x, local_y, local_z))
-            .copied()
+            .as_ref()
+            .and_then(|indices| indices.get(index).copied())
+            .or_else(|| self.packed_indices.as_ref()?.get(index))
     }
 
     #[must_use]
@@ -818,6 +872,28 @@ impl BlockPalette {
         let palette_index = usize::from(self.palette_index_at(local_x, local_y, local_z)?);
         self.states.get(palette_index)
     }
+
+    fn block_state_with_palette_index_at(
+        &self,
+        local_x: u8,
+        local_y: u8,
+        local_z: u8,
+    ) -> Option<BlockStatePaletteEntry<'_>> {
+        let palette_index = usize::from(self.palette_index_at(local_x, local_y, local_z)?);
+        let state = self.states.get(palette_index)?;
+        Some(BlockStatePaletteEntry {
+            state,
+            storage_index: 0,
+            palette_index,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockStatePaletteEntry<'chunk> {
+    pub(crate) state: &'chunk BlockState,
+    pub(crate) storage_index: usize,
+    pub(crate) palette_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -825,6 +901,8 @@ impl BlockPalette {
 pub enum SubChunkDecodeMode {
     /// Decode palette counts without retaining all block indices.
     CountsOnly,
+    /// Retain packed palette indices for exact surface-column sampling.
+    SurfaceColumns,
     #[default]
     /// Decode and retain full block index arrays.
     FullIndices,
@@ -908,6 +986,24 @@ impl SubChunk {
         }
     }
 
+    pub(crate) fn visible_block_surface_states_at(
+        &self,
+        local_x: u8,
+        local_y: u8,
+        local_z: u8,
+    ) -> VisibleBlockSurfaceStatesAt<'_> {
+        let storages = match &self.format {
+            SubChunkFormat::Paletted { storages, .. } => Some(storages.iter().enumerate().rev()),
+            _ => None,
+        };
+        VisibleBlockSurfaceStatesAt {
+            storages,
+            local_x,
+            local_y,
+            local_z,
+        }
+    }
+
     #[must_use]
     /// Legacy block id at.
     pub fn legacy_block_id_at(&self, local_x: u8, local_y: u8, local_z: u8) -> Option<u8> {
@@ -945,31 +1041,44 @@ impl<'chunk> Iterator for VisibleBlockStatesAt<'chunk> {
     fn next(&mut self) -> Option<Self::Item> {
         let storages = self.storages.as_mut()?;
         for storage in storages {
-            let Some(state) = storage.block_state_at(self.local_x, self.local_y, self.local_z)
+            let Some(entry) =
+                storage.block_state_with_palette_index_at(self.local_x, self.local_y, self.local_z)
             else {
                 continue;
             };
-            if !is_air_block_state_name(&state.name) {
-                return Some(state);
+            if !is_air_block_name(&entry.state.name) {
+                return Some(entry.state);
             }
         }
         None
     }
 }
 
-fn is_air_block_state_name(name: &str) -> bool {
-    matches!(
-        name,
-        "air"
-            | "cave_air"
-            | "void_air"
-            | "minecraft:air"
-            | "minecraft:cave_air"
-            | "minecraft:void_air"
-            | "minecraft:structure_void"
-            | "minecraft:light_block"
-            | "minecraft:light"
-    )
+pub(crate) struct VisibleBlockSurfaceStatesAt<'chunk> {
+    storages: Option<std::iter::Rev<std::iter::Enumerate<std::slice::Iter<'chunk, BlockPalette>>>>,
+    local_x: u8,
+    local_y: u8,
+    local_z: u8,
+}
+
+impl<'chunk> Iterator for VisibleBlockSurfaceStatesAt<'chunk> {
+    type Item = BlockStatePaletteEntry<'chunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let storages = self.storages.as_mut()?;
+        for (storage_index, storage) in storages {
+            let Some(mut entry) =
+                storage.block_state_with_palette_index_at(self.local_x, self.local_y, self.local_z)
+            else {
+                continue;
+            };
+            if !is_air_block_name(&entry.state.name) {
+                entry.storage_index = storage_index;
+                return Some(entry);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1515,27 +1624,99 @@ fn parse_palette_storages(
         for _ in 0..palette_len {
             let (tag, consumed) = parse_root_nbt_with_consumed(&bytes[offset..])?;
             offset += consumed;
-            states.push(block_state_from_nbt(&tag));
+            states.push(block_state_from_nbt(tag));
         }
-
-        let indices = unpack_palette_indices(words_bytes, bits_per_block, palette_len)?;
-        let mut counts = vec![0_u16; palette_len];
-        for index in &indices {
-            if let Some(count) = counts.get_mut(usize::from(*index)) {
-                *count = count.saturating_add(1);
+        let mut counts =
+            (mode != SubChunkDecodeMode::SurfaceColumns).then(|| vec![0_u16; palette_len]);
+        let (indices, packed_indices) = match mode {
+            SubChunkDecodeMode::FullIndices => {
+                let indices = unpack_palette_indices(words_bytes, bits_per_block, palette_len)?;
+                for index in &indices {
+                    if let Some(count) = counts
+                        .as_mut()
+                        .and_then(|counts| counts.get_mut(usize::from(*index)))
+                    {
+                        *count = count.saturating_add(1);
+                    }
+                }
+                (Some(indices), None)
             }
-        }
-        let indices = match mode {
-            SubChunkDecodeMode::CountsOnly => None,
-            SubChunkDecodeMode::FullIndices => Some(indices),
+            SubChunkDecodeMode::CountsOnly => {
+                count_packed_palette_indices(
+                    words_bytes,
+                    bits_per_block,
+                    palette_len,
+                    counts.as_deref_mut().ok_or_else(|| {
+                        BedrockWorldError::Validation(
+                            "counts-only decode did not allocate palette counts".to_string(),
+                        )
+                    })?,
+                )?;
+                (None, None)
+            }
+            SubChunkDecodeMode::SurfaceColumns => (
+                None,
+                Some(PackedPaletteIndices {
+                    bytes: Bytes::copy_from_slice(words_bytes),
+                    bits_per_block,
+                    palette_len,
+                }),
+            ),
         };
         storages.push(BlockPalette {
             states,
             indices,
+            packed_indices,
             counts,
         });
     }
     Ok((storages, offset))
+}
+
+fn count_packed_palette_indices(
+    words_bytes: &[u8],
+    bits_per_block: u8,
+    palette_len: usize,
+    counts: &mut [u16],
+) -> Result<()> {
+    if bits_per_block == 0 {
+        if let Some(count) = counts.first_mut() {
+            *count = 4096;
+        }
+        return Ok(());
+    }
+    let values_per_word = usize::from(32 / bits_per_block);
+    let mask = (1_u32 << bits_per_block) - 1;
+    let mut decoded = 0usize;
+    for word_bytes in words_bytes.chunks_exact(4) {
+        let word = u32::from_le_bytes(
+            word_bytes
+                .try_into()
+                .map_err(|_| BedrockWorldError::CorruptWorld("bad palette word".to_string()))?,
+        );
+        for item_index in 0..values_per_word {
+            if decoded == 4096 {
+                return Ok(());
+            }
+            let value = ((word >> (item_index * usize::from(bits_per_block))) & mask) as u16;
+            if usize::from(value) >= palette_len {
+                return Err(BedrockWorldError::UnsupportedChunkFormat(format!(
+                    "palette index {value} exceeds palette length {palette_len}"
+                )));
+            }
+            if let Some(count) = counts.get_mut(usize::from(value)) {
+                *count = count.saturating_add(1);
+            }
+            decoded = decoded.saturating_add(1);
+        }
+    }
+    if decoded == 4096 {
+        Ok(())
+    } else {
+        Err(BedrockWorldError::UnsupportedChunkFormat(
+            "palette block indices are truncated".to_string(),
+        ))
+    }
 }
 
 fn packed_word_count(bits_per_block: u8) -> usize {
@@ -1585,7 +1766,7 @@ fn unpack_palette_indices(
     Ok(indices)
 }
 
-fn block_state_from_nbt(tag: &NbtTag) -> BlockState {
+fn block_state_from_nbt(tag: NbtTag) -> BlockState {
     let NbtTag::Compound(root) = tag else {
         return BlockState {
             name: "<invalid>".to_string(),
@@ -1593,18 +1774,43 @@ fn block_state_from_nbt(tag: &NbtTag) -> BlockState {
             version: None,
         };
     };
-    let name = string_field(root, "name")
-        .or_else(|| string_field(root, "Name"))
-        .unwrap_or("<unknown>")
-        .to_string();
-    let states = match root.get("states").or_else(|| root.get("States")) {
-        Some(NbtTag::Compound(values)) => values
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
+    block_state_from_nbt_root(root)
+}
+
+fn block_state_from_nbt_root(root: IndexMap<String, NbtTag>) -> BlockState {
+    let mut name = None;
+    let mut fallback_name = None;
+    let mut states_tag = None;
+    let mut fallback_states_tag = None;
+    let mut saw_states_tag = false;
+    let mut version = None;
+    let mut fallback_version = None;
+    for (key, value) in root {
+        match (key.as_str(), value) {
+            ("name", NbtTag::String(value)) => name = Some(value),
+            ("Name", NbtTag::String(value)) => fallback_name = Some(value),
+            ("states", value) => {
+                saw_states_tag = true;
+                states_tag = Some(value);
+            }
+            ("States", value) => fallback_states_tag = Some(value),
+            ("version", value) => version = int_from_tag(value),
+            ("Version", value) => fallback_version = int_from_tag(value),
+            _ => {}
+        }
+    }
+    let name = name
+        .or(fallback_name)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let states = match if saw_states_tag {
+        states_tag
+    } else {
+        fallback_states_tag
+    } {
+        Some(NbtTag::Compound(values)) => values.into_iter().collect(),
         _ => BTreeMap::new(),
     };
-    let version = int_field(root, "version").or_else(|| int_field(root, "Version"));
+    let version = version.or(fallback_version);
     BlockState {
         name,
         states,
@@ -1612,18 +1818,11 @@ fn block_state_from_nbt(tag: &NbtTag) -> BlockState {
     }
 }
 
-fn string_field<'a>(root: &'a IndexMap<String, NbtTag>, key: &str) -> Option<&'a str> {
-    match root.get(key) {
-        Some(NbtTag::String(value)) => Some(value.as_str()),
-        _ => None,
-    }
-}
-
-fn int_field(root: &IndexMap<String, NbtTag>, key: &str) -> Option<i32> {
-    match root.get(key) {
-        Some(NbtTag::Byte(value)) => Some(i32::from(*value)),
-        Some(NbtTag::Short(value)) => Some(i32::from(*value)),
-        Some(NbtTag::Int(value)) => Some(*value),
+fn int_from_tag(tag: NbtTag) -> Option<i32> {
+    match tag {
+        NbtTag::Byte(value) => Some(i32::from(value)),
+        NbtTag::Short(value) => Some(i32::from(value)),
+        NbtTag::Int(value) => Some(value),
         _ => None,
     }
 }
@@ -1987,7 +2186,15 @@ mod tests {
             };
             assert_eq!(storages.len(), 1);
             assert_eq!(storages[0].indices.as_ref().expect("indices").len(), 4096);
-            assert_eq!(storages[0].counts.iter().sum::<u16>(), 4096);
+            assert_eq!(
+                storages[0]
+                    .counts
+                    .as_ref()
+                    .expect("full indices retain counts")
+                    .iter()
+                    .sum::<u16>(),
+                4096
+            );
         }
     }
 
@@ -2003,7 +2210,47 @@ mod tests {
             panic!("expected paletted subchunk");
         };
         assert!(storages[0].indices.is_none());
-        assert_eq!(storages[0].counts.iter().sum::<u16>(), 4096);
+        assert_eq!(
+            storages[0]
+                .counts
+                .as_ref()
+                .expect("counts-only retains counts")
+                .iter()
+                .sum::<u16>(),
+            4096
+        );
+    }
+
+    #[test]
+    fn surface_columns_keep_random_access_without_full_indices() {
+        let bytes = build_paletted_subchunk(8, None, 4, 4);
+        let full = parse_subchunk_with_mode(
+            0,
+            Bytes::from(bytes.clone()),
+            SubChunkDecodeMode::FullIndices,
+        )
+        .expect("parse full indices");
+        let surface =
+            parse_subchunk_with_mode(0, Bytes::from(bytes), SubChunkDecodeMode::SurfaceColumns)
+                .expect("parse surface columns");
+
+        let SubChunkFormat::Paletted {
+            storages: surface_storages,
+            ..
+        } = &surface.format
+        else {
+            panic!("expected surface paletted subchunk");
+        };
+        assert!(surface_storages[0].indices.is_none());
+        assert!(surface_storages[0].packed_indices.is_some());
+        assert!(surface_storages[0].counts.is_none());
+
+        for (x, y, z) in [(0, 0, 0), (1, 2, 3), (15, 15, 15), (7, 9, 4)] {
+            assert_eq!(
+                full.block_state_at(x, y, z),
+                surface.block_state_at(x, y, z)
+            );
+        }
     }
 
     #[test]
@@ -2116,6 +2363,52 @@ mod tests {
     }
 
     #[test]
+    fn visible_surface_state_iterator_reports_palette_positions() {
+        let mut bytes = vec![8, 3];
+        append_test_palette_storage(
+            &mut bytes,
+            &["minecraft:air", "minecraft:water"],
+            |x, y, z| u16::from((x, y, z) == (1, 2, 3)),
+        );
+        append_test_palette_storage(
+            &mut bytes,
+            &["minecraft:air", "minecraft:short_grass"],
+            |x, y, z| u16::from((x, y, z) == (1, 2, 3)),
+        );
+        append_test_palette_storage(
+            &mut bytes,
+            &["minecraft:air", "minecraft:stone"],
+            |x, y, z| u16::from((x, y, z) == (1, 2, 3)),
+        );
+
+        let subchunk = parse_subchunk(0, Bytes::from(bytes)).expect("parse layered subchunk");
+        let SubChunkFormat::Paletted { storages, .. } = &subchunk.format else {
+            panic!("expected paletted subchunk");
+        };
+
+        assert_eq!(storages.len(), 3);
+        let visible_entries = subchunk
+            .visible_block_surface_states_at(1, 2, 3)
+            .map(|entry| {
+                (
+                    entry.storage_index,
+                    entry.palette_index,
+                    entry.state.name.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible_entries,
+            [
+                (2, 1, "minecraft:stone"),
+                (1, 1, "minecraft:short_grass"),
+                (0, 1, "minecraft:water")
+            ]
+        );
+    }
+
+    #[test]
     fn paletted_subchunk_v9_decodes_zero_bit_secondary_storage_without_palette_len() {
         let mut bytes = vec![9, 2, 4];
         append_test_palette_storage(
@@ -2132,7 +2425,7 @@ mod tests {
         };
         assert_eq!(storages.len(), 2);
         assert_eq!(storages[1].states.len(), 1);
-        assert_eq!(storages[1].counts, [4096]);
+        assert_eq!(storages[1].counts.as_deref(), Some(&[4096][..]));
         assert_eq!(
             subchunk
                 .block_state_at(4, 2, 4)

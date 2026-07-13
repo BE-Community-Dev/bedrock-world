@@ -42,6 +42,26 @@ fn bench_level_dat(c: &mut Criterion) {
             );
         });
     });
+    group.bench_function("nbt_root_owned_synthetic", |b| {
+        let nbt_payload = &synthetic[8..];
+        b.iter(|| {
+            black_box(
+                NbtReader::new(black_box(nbt_payload))
+                    .parse_root()
+                    .expect("owned root"),
+            );
+        });
+    });
+    group.bench_function("nbt_root_ref_synthetic", |b| {
+        let nbt_payload = &synthetic[8..];
+        b.iter(|| {
+            black_box(
+                NbtReader::new(black_box(nbt_payload))
+                    .parse_root_ref()
+                    .expect("borrowed root"),
+            );
+        });
+    });
     if level_dat_path.exists() {
         group.bench_function("read_fixture", |b| {
             b.iter(|| read_level_dat_document(black_box(&level_dat_path)).expect("read level.dat"));

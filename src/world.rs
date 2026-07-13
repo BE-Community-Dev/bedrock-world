@@ -27,10 +27,12 @@ use crate::parsed::{
 use crate::player::{PlayerData, PlayerId};
 use crate::storage::backend::BedrockLevelDbStorage;
 use crate::storage::{
-    PocketChunksDatStorage, StorageBatch, StorageCancelFlag, StorageOp, StorageProgressSink,
-    StorageReadOptions, StorageScanMode, StorageThreadingOptions, StorageVisitorControl,
-    WorldStorage,
+    PocketChunksDatStorage, StorageBatch, StorageCachePolicy, StorageCancelFlag, StorageOp,
+    StorageProgressSink, StorageReadOptions, StorageScanMode, StorageThreadingOptions,
+    StorageVisitorControl, WorldStorage,
 };
+pub use crate::surface::{TerrainSurfaceRole, terrain_surface_overlay_alpha, terrain_surface_role};
+use crate::surface::{is_air_block_name, is_water_block_name};
 use bytes::Bytes;
 use rayon::{ThreadPoolBuilder, prelude::*};
 use std::path::{Path, PathBuf};
@@ -212,7 +214,7 @@ impl WorldPipelineOptions {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// Ordering policy for render chunk loading.
-pub enum RenderChunkPriority {
+pub enum ChunkLoadPriority {
     #[default]
     /// Process chunks in row-major order.
     RowMajor,
@@ -238,39 +240,112 @@ pub enum ExactSurfaceBiomeLoad {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Render chunk data contract requested by the caller.
-pub enum RenderChunkRequest {
-    /// Load blocks and compute exact surface columns.
-    ExactSurface {
-        /// Exact-surface subchunk loading policy.
-        subchunks: ExactSurfaceSubchunkPolicy,
-        /// Biome loading policy for the render request.
-        biome: ExactSurfaceBiomeLoad,
-        /// Whether block-entity records are loaded with render data.
-        block_entities: bool,
-    },
-    /// Load raw heightmap data for diagnostics.
-    RawHeightMap,
-    /// Load a fixed Y layer.
-    Layer {
-        /// World Y coordinate of the layer to sample.
-        y: i32,
-    },
-    /// Load biome data for a fixed Y layer.
-    Biome {
-        /// World Y coordinate used to choose biome storage.
-        y: i32,
-        /// Whether all matching biome data is loaded.
-        load_all: bool,
-    },
+/// One independently requested subchunk representation.
+pub enum SubchunkDataRequirement {
+    /// Compute exact visible terrain columns without materializing 3D indices.
+    SurfaceColumns(ExactSurfaceSubchunkPolicy),
+    /// Decode one fixed world Y layer with 3D random access.
+    Layer(i32),
+    /// Decode one cave slice with 3D random access.
+    CaveSlice(i32),
+    /// Decode every subchunk in the chunk with full 3D random access.
+    Full3dIndices,
 }
 
-impl Default for RenderChunkRequest {
-    fn default() -> Self {
-        Self::ExactSurface {
-            subchunks: ExactSurfaceSubchunkPolicy::Full,
-            biome: ExactSurfaceBiomeLoad::TopColumns,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Biome payload requested with map data.
+pub enum BiomeDataRequirement {
+    /// Do not load optional biome records.
+    #[default]
+    None,
+    /// Load biome data needed by surface-column sampling.
+    SurfaceColumns,
+    /// Load biome data for one world Y layer.
+    Layer(i32),
+    /// Retain every matching biome storage.
+    All,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Composable map-data contract used to plan storage reads and subchunk decoding.
+///
+/// Add only the representations a consumer needs. The loader unions all requested
+/// subchunk records and chooses the least expensive decoder that satisfies them.
+pub struct ChunkDataRequest {
+    /// Independent subchunk representations to load.
+    pub subchunks: Vec<SubchunkDataRequirement>,
+    /// Whether raw height-map data is required.
+    pub height_map: bool,
+    /// Optional biome payload requirement.
+    pub biome: BiomeDataRequirement,
+    /// Whether block-entity NBT is required.
+    pub block_entities: bool,
+}
+
+impl ChunkDataRequest {
+    #[must_use]
+    /// Starts an empty request.
+    pub const fn new() -> Self {
+        Self {
+            subchunks: Vec::new(),
+            height_map: false,
+            biome: BiomeDataRequirement::None,
             block_entities: false,
+        }
+    }
+
+    #[must_use]
+    /// Requests exact terrain columns with the selected subchunk probing policy.
+    pub fn surface_columns(mut self, policy: ExactSurfaceSubchunkPolicy) -> Self {
+        self.push_subchunk_requirement(SubchunkDataRequirement::SurfaceColumns(policy));
+        self
+    }
+
+    #[must_use]
+    /// Requests a fixed Y layer.
+    pub fn layer(mut self, y: i32) -> Self {
+        self.push_subchunk_requirement(SubchunkDataRequirement::Layer(y));
+        self
+    }
+
+    #[must_use]
+    /// Requests a cave slice at one world Y coordinate.
+    pub fn cave_slice(mut self, y: i32) -> Self {
+        self.push_subchunk_requirement(SubchunkDataRequirement::CaveSlice(y));
+        self
+    }
+
+    #[must_use]
+    /// Requests full 3D random-access indices for every subchunk in a chunk.
+    pub fn full_3d_indices(mut self) -> Self {
+        self.push_subchunk_requirement(SubchunkDataRequirement::Full3dIndices);
+        self
+    }
+
+    #[must_use]
+    /// Requests raw height-map data.
+    pub const fn height_map(mut self) -> Self {
+        self.height_map = true;
+        self
+    }
+
+    #[must_use]
+    /// Sets the optional biome payload requirement.
+    pub const fn biome(mut self, biome: BiomeDataRequirement) -> Self {
+        self.biome = biome;
+        self
+    }
+
+    #[must_use]
+    /// Requests block-entity NBT records.
+    pub const fn block_entities(mut self) -> Self {
+        self.block_entities = true;
+        self
+    }
+
+    fn push_subchunk_requirement(&mut self, requirement: SubchunkDataRequirement) {
+        if !self.subchunks.contains(&requirement) {
+            self.subchunks.push(requirement);
         }
     }
 }
@@ -293,19 +368,6 @@ pub enum TerrainColumnBiome {
     Id(u32),
     /// Legacy biome sample value.
     Legacy(LegacyBiomeSample),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Role assigned to a block during surface sampling.
-pub enum TerrainSurfaceRole {
-    /// Air terrain role.
-    Air,
-    /// Water terrain role.
-    Water,
-    /// Thin overlay terrain role.
-    Overlay,
-    /// Primary solid terrain role.
-    Primary,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -412,7 +474,7 @@ impl Default for TerrainColumnSamples {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// Diagnostics collected while loading render chunks.
-pub struct RenderLoadStats {
+pub struct ChunkLoadStats {
     /// Number of chunks requested by the caller.
     pub requested_chunks: usize,
     /// Number of chunks with renderable data loaded.
@@ -439,12 +501,20 @@ pub struct RenderLoadStats {
     pub db_read_ms: u128,
     /// Milliseconds spent parsing biome records.
     pub biome_parse_ms: u128,
+    /// Microseconds spent parsing biome records.
+    pub biome_parse_us: u128,
     /// Milliseconds spent parsing subchunk records.
     pub subchunk_parse_ms: u128,
+    /// Microseconds spent parsing subchunk records.
+    pub subchunk_parse_us: u128,
     /// Milliseconds spent computing surface columns.
     pub surface_scan_ms: u128,
+    /// Microseconds spent computing surface columns.
+    pub surface_scan_us: u128,
     /// Milliseconds spent parsing block-entity records.
     pub block_entity_parse_ms: u128,
+    /// Microseconds spent parsing block-entity records.
+    pub block_entity_parse_us: u128,
     /// Milliseconds spent on full reloads for exact surface requests.
     pub full_reload_ms: u128,
     /// Number of legacy terrain records loaded.
@@ -477,9 +547,9 @@ pub struct RenderLoadStats {
 
 #[derive(Debug, Clone)]
 /// Options controlling render chunk loading.
-pub struct RenderChunkLoadOptions {
-    /// Render data contract requested by the caller.
-    pub request: RenderChunkRequest,
+pub struct ChunkLoadOptions {
+    /// Composable map-data contract requested by the caller.
+    pub data_request: ChunkDataRequest,
     /// Subchunk decode mode used while loading render data.
     pub subchunk_decode: SubChunkDecodeMode,
     /// Threading policy for this operation.
@@ -491,26 +561,93 @@ pub struct RenderChunkLoadOptions {
     /// Optional progress sink invoked during long-running work.
     pub progress: Option<ProgressSink>,
     /// Ordering policy for chunk loading.
-    pub priority: RenderChunkPriority,
+    pub priority: ChunkLoadPriority,
+    /// Backend cache strategy for exact storage reads used by render loading.
+    pub storage_cache_policy: StorageCachePolicy,
 }
 
-impl Default for RenderChunkLoadOptions {
+impl Default for ChunkLoadOptions {
     fn default() -> Self {
         Self {
-            request: RenderChunkRequest::default(),
+            data_request: ChunkDataRequest::new()
+                .surface_columns(ExactSurfaceSubchunkPolicy::Full)
+                .biome(BiomeDataRequirement::SurfaceColumns),
             subchunk_decode: SubChunkDecodeMode::FullIndices,
             threading: WorldThreadingOptions::Auto,
             pipeline: WorldPipelineOptions::default(),
             cancel: None,
             progress: None,
-            priority: RenderChunkPriority::RowMajor,
+            priority: ChunkLoadPriority::RowMajor,
+            storage_cache_policy: StorageCachePolicy::Use,
+        }
+    }
+}
+
+impl ChunkLoadOptions {
+    #[must_use]
+    /// Creates options from an explicit composable map-data contract.
+    pub fn for_data_request(data_request: ChunkDataRequest) -> Self {
+        Self {
+            data_request,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    /// Creates a surface-column load that avoids materializing full 3D palette indices.
+    pub fn exact_surface_columns(
+        subchunks: ExactSurfaceSubchunkPolicy,
+        biome: ExactSurfaceBiomeLoad,
+        block_entities: bool,
+    ) -> Self {
+        Self {
+            data_request: ChunkDataRequest::new()
+                .surface_columns(subchunks)
+                .biome(match biome {
+                    ExactSurfaceBiomeLoad::None => BiomeDataRequirement::None,
+                    ExactSurfaceBiomeLoad::TopColumns => BiomeDataRequirement::SurfaceColumns,
+                    ExactSurfaceBiomeLoad::All => BiomeDataRequirement::All,
+                })
+                .block_entities_if(block_entities),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    /// Creates a raw-height-map load with no subchunk index materialization.
+    pub fn raw_height_map() -> Self {
+        Self {
+            data_request: ChunkDataRequest::new().height_map(),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    /// Creates a fixed-layer load for one world Y coordinate.
+    pub fn layer(y: i32) -> Self {
+        Self {
+            data_request: ChunkDataRequest::new().layer(y),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    /// Creates a biome-only load for one world Y coordinate.
+    pub fn biome(y: i32, load_all: bool) -> Self {
+        Self {
+            data_request: ChunkDataRequest::new().biome(if load_all {
+                BiomeDataRequirement::All
+            } else {
+                BiomeDataRequirement::Layer(y)
+            }),
+            ..Self::default()
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 /// Block entity included with render chunk data.
-pub struct RenderBlockEntity {
+pub struct ChunkBlockEntity {
     /// Identifier value decoded from storage or NBT.
     pub id: Option<String>,
     /// World block position `[x, y, z]` decoded from NBT, when present.
@@ -521,7 +658,7 @@ pub struct RenderBlockEntity {
 
 #[derive(Debug, Clone, PartialEq)]
 /// Loaded render-oriented chunk data.
-pub struct RenderChunkData {
+pub struct ChunkData {
     /// Chunk position represented by this render data.
     pub pos: ChunkPos,
     /// Whether enough records were found to treat the chunk as loaded.
@@ -537,7 +674,7 @@ pub struct RenderChunkData {
     /// Exact-surface subchunk loading policy.
     pub subchunks: BTreeMap<i8, SubChunk>,
     /// Whether block-entity records are loaded with render data.
-    pub block_entities: Vec<RenderBlockEntity>,
+    pub block_entities: Vec<ChunkBlockEntity>,
     /// `LegacyTerrain` record when present for old `LevelDB` worlds.
     pub legacy_terrain: Option<LegacyTerrain>,
     /// Canonical surface-column samples computed from actual block data.
@@ -546,7 +683,7 @@ pub struct RenderChunkData {
     pub version: crate::ChunkVersion,
 }
 
-impl RenderChunkData {
+impl ChunkData {
     #[must_use]
     /// Returns the sampled terrain column at local chunk coordinates.
     pub fn column_sample_at(&self, local_x: u8, local_z: u8) -> Option<&TerrainColumnSample> {
@@ -555,7 +692,7 @@ impl RenderChunkData {
 }
 
 #[derive(Debug, Clone)]
-struct RawRenderChunkData {
+struct RawChunkData {
     pos: ChunkPos,
     biome_record: Option<(crate::ChunkVersion, Bytes)>,
     subchunks: BTreeMap<i8, Bytes>,
@@ -565,23 +702,23 @@ struct RawRenderChunkData {
 
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(clippy::struct_field_names)]
-struct RenderChunkDecodeTiming {
-    biome_parse_ms: u128,
-    subchunk_parse_ms: u128,
-    surface_scan_ms: u128,
-    block_entity_parse_ms: u128,
+struct ChunkDecodeTiming {
+    biome_parse_us: u128,
+    subchunk_parse_us: u128,
+    surface_scan_us: u128,
+    block_entity_parse_us: u128,
 }
 
-impl RenderChunkDecodeTiming {
+impl ChunkDecodeTiming {
     fn add(&mut self, other: Self) {
-        self.biome_parse_ms = self.biome_parse_ms.saturating_add(other.biome_parse_ms);
-        self.subchunk_parse_ms = self
-            .subchunk_parse_ms
-            .saturating_add(other.subchunk_parse_ms);
-        self.surface_scan_ms = self.surface_scan_ms.saturating_add(other.surface_scan_ms);
-        self.block_entity_parse_ms = self
-            .block_entity_parse_ms
-            .saturating_add(other.block_entity_parse_ms);
+        self.biome_parse_us = self.biome_parse_us.saturating_add(other.biome_parse_us);
+        self.subchunk_parse_us = self
+            .subchunk_parse_us
+            .saturating_add(other.subchunk_parse_us);
+        self.surface_scan_us = self.surface_scan_us.saturating_add(other.surface_scan_us);
+        self.block_entity_parse_us = self
+            .block_entity_parse_us
+            .saturating_add(other.block_entity_parse_us);
     }
 }
 
@@ -603,9 +740,9 @@ struct RenderRecordRequest {
 
 #[derive(Debug, Clone)]
 /// Options controlling render region loading.
-pub struct RenderRegionLoadOptions {
-    /// Render data contract requested by the caller.
-    pub request: RenderChunkRequest,
+pub struct WorldChunkQueryRegionLoadOptions {
+    /// Composable map-data contract requested by the caller.
+    pub data_request: ChunkDataRequest,
     /// Subchunk decode mode used while loading render data.
     pub subchunk_decode: SubChunkDecodeMode,
     /// Threading policy for this operation.
@@ -617,40 +754,72 @@ pub struct RenderRegionLoadOptions {
     /// Optional progress sink invoked during long-running work.
     pub progress: Option<ProgressSink>,
     /// Ordering policy for chunk loading.
-    pub priority: RenderChunkPriority,
+    pub priority: ChunkLoadPriority,
+    /// Backend cache strategy for exact storage reads used by render loading.
+    pub storage_cache_policy: StorageCachePolicy,
 }
 
-impl Default for RenderRegionLoadOptions {
+impl Default for WorldChunkQueryRegionLoadOptions {
     fn default() -> Self {
         Self {
-            request: RenderChunkRequest::default(),
+            data_request: ChunkLoadOptions::default().data_request,
             subchunk_decode: SubChunkDecodeMode::FullIndices,
             threading: WorldThreadingOptions::Auto,
             pipeline: WorldPipelineOptions::default(),
             cancel: None,
             progress: None,
-            priority: RenderChunkPriority::RowMajor,
+            priority: ChunkLoadPriority::RowMajor,
+            storage_cache_policy: StorageCachePolicy::Use,
         }
     }
 }
 
-impl From<RenderRegionLoadOptions> for RenderChunkLoadOptions {
-    fn from(options: RenderRegionLoadOptions) -> Self {
+impl From<WorldChunkQueryRegionLoadOptions> for ChunkLoadOptions {
+    fn from(options: WorldChunkQueryRegionLoadOptions) -> Self {
         Self {
-            request: options.request,
+            data_request: options.data_request,
             subchunk_decode: options.subchunk_decode,
             threading: options.threading,
             pipeline: options.pipeline,
             cancel: options.cancel,
             progress: options.progress,
             priority: options.priority,
+            storage_cache_policy: options.storage_cache_policy,
+        }
+    }
+}
+
+impl ChunkDataRequest {
+    fn block_entities_if(mut self, enabled: bool) -> Self {
+        self.block_entities = enabled;
+        self
+    }
+
+    fn preferred_decode_mode(&self) -> SubChunkDecodeMode {
+        if self.subchunks.iter().any(|requirement| {
+            matches!(
+                requirement,
+                SubchunkDataRequirement::Layer(_)
+                    | SubchunkDataRequirement::CaveSlice(_)
+                    | SubchunkDataRequirement::Full3dIndices
+            )
+        }) {
+            SubChunkDecodeMode::FullIndices
+        } else if self
+            .subchunks
+            .iter()
+            .any(|requirement| matches!(requirement, SubchunkDataRequirement::SurfaceColumns(_)))
+        {
+            SubChunkDecodeMode::SurfaceColumns
+        } else {
+            SubChunkDecodeMode::CountsOnly
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Inclusive chunk rectangle to load or scan for rendering.
-pub struct RenderChunkRegion {
+pub struct WorldChunkQueryRegion {
     /// Bedrock dimension covered by this region.
     pub dimension: crate::Dimension,
     /// Inclusive minimum chunk X coordinate.
@@ -665,13 +834,13 @@ pub struct RenderChunkRegion {
 
 #[derive(Debug, Clone, PartialEq)]
 /// Loaded render region and load diagnostics.
-pub struct RenderRegionData {
+pub struct WorldChunkQueryRegionData {
     /// Inclusive chunk region requested by the load.
-    pub region: RenderChunkRegion,
+    pub region: WorldChunkQueryRegion,
     /// Parsed or loaded chunks in this result.
-    pub chunks: Vec<RenderChunkData>,
+    pub chunks: Vec<ChunkData>,
     /// Load diagnostics and timing counters.
-    pub stats: RenderLoadStats,
+    pub stats: ChunkLoadStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1033,10 +1202,10 @@ where
         if self.storage().get(b"~local_player")?.is_some() {
             players.push(PlayerId::Local);
         }
-        self.storage().for_each_prefix(
+        self.storage().for_each_prefix_key(
             b"player_",
             StorageReadOptions::default(),
-            &mut |key, _value| {
+            &mut |key| {
                 if let Some(player) = PlayerId::from_storage_key(key) {
                     players.push(player);
                 }
@@ -1136,9 +1305,9 @@ where
 
     #[allow(clippy::too_many_lines)]
     /// List render chunk positions in region blocking.
-    pub fn list_render_chunk_positions_in_region_blocking(
+    pub fn list_chunk_positions_in_region_blocking(
         &self,
-        region: RenderChunkRegion,
+        region: WorldChunkQueryRegion,
         options: WorldScanOptions,
     ) -> Result<Vec<ChunkPos>> {
         let started = Instant::now();
@@ -1639,48 +1808,80 @@ where
     }
 
     /// Load render chunk blocking.
-    pub fn load_render_chunk_blocking(
+    pub fn query_chunk_data_blocking(
         &self,
         pos: ChunkPos,
-        options: RenderChunkLoadOptions,
-    ) -> Result<RenderChunkData> {
-        let (mut chunks, _) = self.load_render_chunks_with_stats_blocking([pos], options)?;
+        options: ChunkLoadOptions,
+    ) -> Result<ChunkData> {
+        let (mut chunks, _) = self.query_chunk_data_with_stats_blocking([pos], options)?;
         chunks.pop().ok_or_else(|| {
             BedrockWorldError::CorruptWorld("exact render load returned no chunk".to_string())
         })
     }
 
+    /// Loads only canonical terrain column samples for one chunk.
+    ///
+    /// The request remains configurable for subchunk, biome, block-entity, storage,
+    /// cancellation, and threading policy, but this entry point always retains packed
+    /// palette indices rather than materializing full 3D index arrays.
+    pub fn load_surface_columns_blocking(
+        &self,
+        pos: ChunkPos,
+        mut options: ChunkLoadOptions,
+    ) -> Result<Option<TerrainColumnSamples>> {
+        let mut request = options.data_request.clone();
+        if !request
+            .subchunks
+            .iter()
+            .any(|requirement| matches!(requirement, SubchunkDataRequirement::SurfaceColumns(_)))
+        {
+            return Err(BedrockWorldError::Validation(
+                "surface-column loads require a SurfaceColumns data requirement".to_string(),
+            ));
+        }
+        request.subchunks.retain(|requirement| {
+            !matches!(
+                requirement,
+                SubchunkDataRequirement::Layer(_)
+                    | SubchunkDataRequirement::CaveSlice(_)
+                    | SubchunkDataRequirement::Full3dIndices
+            )
+        });
+        options.data_request = request;
+        Ok(self.query_chunk_data_blocking(pos, options)?.column_samples)
+    }
+
     /// Load render chunks blocking.
-    pub fn load_render_chunks_blocking(
+    pub fn query_chunk_data_many_blocking(
         &self,
         positions: impl IntoIterator<Item = ChunkPos>,
-        options: RenderChunkLoadOptions,
-    ) -> Result<Vec<RenderChunkData>> {
+        options: ChunkLoadOptions,
+    ) -> Result<Vec<ChunkData>> {
         Ok(self
-            .load_render_chunks_with_stats_blocking(positions, options)?
+            .query_chunk_data_with_stats_blocking(positions, options)?
             .0)
     }
 
     /// Load render chunks with stats blocking.
-    pub fn load_render_chunks_with_stats_blocking(
+    pub fn query_chunk_data_with_stats_blocking(
         &self,
         positions: impl IntoIterator<Item = ChunkPos>,
-        options: RenderChunkLoadOptions,
-    ) -> Result<(Vec<RenderChunkData>, RenderLoadStats)> {
+        options: ChunkLoadOptions,
+    ) -> Result<(Vec<ChunkData>, ChunkLoadStats)> {
         let started = Instant::now();
         let positions = positions.into_iter().collect::<Vec<_>>();
         if positions.is_empty() {
             log::debug!("loading render chunks skipped (chunks=0)");
-            return Ok((Vec::new(), RenderLoadStats::default()));
+            return Ok((Vec::new(), ChunkLoadStats::default()));
         }
         let mut positions = positions;
         sort_render_chunk_positions(&mut positions, options.priority);
         let worker_count = options.threading.resolve_checked(positions.len())?;
         log::debug!(
-            "loading render chunks (chunks={}, workers={}, request={:?}, queue_depth={}, priority={:?})",
+            "loading render chunks (chunks={}, workers={}, data_request={:?}, queue_depth={}, priority={:?})",
             positions.len(),
             worker_count,
-            options.request,
+            options.data_request,
             options
                 .pipeline
                 .resolve_queue_depth(worker_count, positions.len()),
@@ -1698,15 +1899,15 @@ where
     fn load_render_chunks_exact_batch_blocking_sorted(
         &self,
         positions: Vec<ChunkPos>,
-        options: RenderChunkLoadOptions,
+        options: ChunkLoadOptions,
         worker_count: usize,
         started: Instant,
-    ) -> Result<(Vec<RenderChunkData>, RenderLoadStats)> {
+    ) -> Result<(Vec<ChunkData>, ChunkLoadStats)> {
         check_render_load_cancelled(&options)?;
         let mut raw_chunks = positions
             .iter()
             .copied()
-            .map(|pos| RawRenderChunkData {
+            .map(|pos| RawChunkData {
                 pos,
                 biome_record: None,
                 subchunks: BTreeMap::new(),
@@ -1718,14 +1919,16 @@ where
         let mut keys = Vec::new();
         let mut requests = Vec::new();
         for (chunk_index, pos) in positions.iter().copied().enumerate() {
-            push_render_record_request(
-                &mut keys,
-                &mut requests,
-                chunk_index,
-                pos,
-                RenderRecordKind::LegacyTerrain,
-            );
-            if request_needs_biome_record(options.request) {
+            if request_needs_legacy_terrain(&options) {
+                push_render_record_request(
+                    &mut keys,
+                    &mut requests,
+                    chunk_index,
+                    pos,
+                    RenderRecordKind::LegacyTerrain,
+                );
+            }
+            if request_needs_biome_record(&options) {
                 push_render_record_request(
                     &mut keys,
                     &mut requests,
@@ -1748,7 +1951,7 @@ where
                     RenderRecordKind::Data2DLegacy,
                 );
             }
-            if !request_uses_hint_surface_subchunks(options.request) {
+            if !request_uses_hint_surface_subchunks(&options) {
                 for y in planned_render_subchunk_ys(pos, &options, None)? {
                     push_render_record_request(
                         &mut keys,
@@ -1759,7 +1962,7 @@ where
                     );
                 }
             }
-            if request_loads_block_entities(options.request) {
+            if request_loads_block_entities(&options) {
                 push_render_record_request(
                     &mut keys,
                     &mut requests,
@@ -1773,13 +1976,46 @@ where
         let mut keys_requested = keys.len();
         let mut exact_get_batches = 0usize;
         let mut db_read_ms = 0u128;
+        let storage_read_options = to_render_storage_read_options(&options);
         let db_started = Instant::now();
-        let values = self.storage().get_many(&keys)?;
+        let values = self
+            .storage()
+            .get_many_ordered_with_control(&keys, storage_read_options.clone())?;
         db_read_ms = db_read_ms.saturating_add(db_started.elapsed().as_millis());
         exact_get_batches = exact_get_batches.saturating_add(usize::from(!keys.is_empty()));
         let mut keys_found = apply_render_record_values(&mut raw_chunks, &requests, values);
 
-        if request_uses_hint_surface_subchunks(options.request) {
+        if request_needs_legacy_terrain_fallback(&options) {
+            let mut fallback_keys = Vec::new();
+            let mut fallback_requests = Vec::new();
+            for (chunk_index, raw) in raw_chunks.iter().enumerate() {
+                if raw.subchunks.is_empty() && raw.legacy_terrain.is_none() {
+                    push_render_record_request(
+                        &mut fallback_keys,
+                        &mut fallback_requests,
+                        chunk_index,
+                        raw.pos,
+                        RenderRecordKind::LegacyTerrain,
+                    );
+                }
+            }
+            if !fallback_keys.is_empty() {
+                let db_started = Instant::now();
+                let values = self
+                    .storage()
+                    .get_many_ordered_with_control(&fallback_keys, storage_read_options.clone())?;
+                db_read_ms = db_read_ms.saturating_add(db_started.elapsed().as_millis());
+                exact_get_batches = exact_get_batches.saturating_add(1);
+                keys_requested = keys_requested.saturating_add(fallback_keys.len());
+                keys_found = keys_found.saturating_add(apply_render_record_values(
+                    &mut raw_chunks,
+                    &fallback_requests,
+                    values,
+                ));
+            }
+        }
+
+        if request_uses_hint_surface_subchunks(&options) {
             let mut needed_keys = Vec::new();
             let mut needed_requests = Vec::new();
             for (chunk_index, raw) in raw_chunks.iter().enumerate() {
@@ -1804,7 +2040,9 @@ where
             }
             if !needed_keys.is_empty() {
                 let db_started = Instant::now();
-                let values = self.storage().get_many(&needed_keys)?;
+                let values = self
+                    .storage()
+                    .get_many_ordered_with_control(&needed_keys, storage_read_options.clone())?;
                 db_read_ms = db_read_ms.saturating_add(db_started.elapsed().as_millis());
                 exact_get_batches = exact_get_batches.saturating_add(1);
                 keys_requested = keys_requested.saturating_add(needed_keys.len());
@@ -1820,7 +2058,7 @@ where
         let decode_started = Instant::now();
         let (mut chunks, decode_timing) = if worker_count == 1 {
             let mut chunks = Vec::with_capacity(raw_chunks.len());
-            let mut timing = RenderChunkDecodeTiming::default();
+            let mut timing = ChunkDecodeTiming::default();
             for raw in raw_chunks {
                 check_render_load_cancelled(&options)?;
                 let (chunk, chunk_timing) = render_chunk_from_raw(raw, &options)?;
@@ -1841,7 +2079,7 @@ where
                     .collect::<Result<Vec<_>>>()
             })?;
             let mut chunks = Vec::with_capacity(decoded.len());
-            let mut timing = RenderChunkDecodeTiming::default();
+            let mut timing = ChunkDecodeTiming::default();
             for (chunk, chunk_timing) in decoded {
                 timing.add(chunk_timing);
                 chunks.push(chunk);
@@ -1858,10 +2096,14 @@ where
         stats.prefix_scans = 0;
         stats.decode_ms = decode_ms;
         stats.db_read_ms = db_read_ms;
-        stats.biome_parse_ms = decode_timing.biome_parse_ms;
-        stats.subchunk_parse_ms = decode_timing.subchunk_parse_ms;
-        stats.surface_scan_ms = decode_timing.surface_scan_ms;
-        stats.block_entity_parse_ms = decode_timing.block_entity_parse_ms;
+        stats.biome_parse_us = decode_timing.biome_parse_us;
+        stats.subchunk_parse_us = decode_timing.subchunk_parse_us;
+        stats.surface_scan_us = decode_timing.surface_scan_us;
+        stats.block_entity_parse_us = decode_timing.block_entity_parse_us;
+        stats.biome_parse_ms = stats.biome_parse_us / 1_000;
+        stats.subchunk_parse_ms = stats.subchunk_parse_us / 1_000;
+        stats.surface_scan_ms = stats.surface_scan_us / 1_000;
+        stats.block_entity_parse_ms = stats.block_entity_parse_us / 1_000;
         stats.full_reload_ms = full_reload_ms;
         stats.detected_format = self.format;
         stats.legacy_pocket_chunks = if self.format == WorldFormat::PocketChunksDat {
@@ -1875,15 +2117,15 @@ where
 
     fn reload_incomplete_needed_exact_surface_chunks_blocking(
         &self,
-        chunks: &mut [RenderChunkData],
-        options: &RenderChunkLoadOptions,
+        chunks: &mut [ChunkData],
+        options: &ChunkLoadOptions,
     ) -> Result<u128> {
-        if !request_uses_hint_surface_subchunks(options.request) {
+        if !request_uses_hint_surface_subchunks(options) {
             return Ok(0);
         }
 
         let mut full_options = options.clone();
-        full_options.request = exact_surface_full_request(options.request);
+        exact_surface_full_request(&mut full_options);
         let mut reload_indexes = Vec::new();
         let mut reload_positions = Vec::new();
         for (index, chunk) in chunks.iter().enumerate() {
@@ -1904,7 +2146,7 @@ where
             WorldThreadingOptions::Fixed(worker_count)
         };
         let (reloaded, stats) =
-            self.load_render_chunks_with_stats_blocking(reload_positions, full_options)?;
+            self.query_chunk_data_with_stats_blocking(reload_positions, full_options)?;
         for (chunk_index, reloaded_chunk) in reload_indexes.into_iter().zip(reloaded) {
             if let Some(chunk) = chunks.get_mut(chunk_index) {
                 *chunk = reloaded_chunk;
@@ -1923,11 +2165,11 @@ where
     }
 
     /// Load render region blocking.
-    pub fn load_render_region_blocking(
+    pub fn query_chunk_region_blocking(
         &self,
-        region: RenderChunkRegion,
-        options: RenderRegionLoadOptions,
-    ) -> Result<RenderRegionData> {
+        region: WorldChunkQueryRegion,
+        options: WorldChunkQueryRegionLoadOptions,
+    ) -> Result<WorldChunkQueryRegionData> {
         if region.min_chunk_x > region.max_chunk_x || region.min_chunk_z > region.max_chunk_z {
             return Err(BedrockWorldError::Validation(format!(
                 "invalid render region: min=({}, {}) max=({}, {})",
@@ -1949,8 +2191,8 @@ where
             }
         }
         let (chunks, stats) =
-            self.load_render_chunks_with_stats_blocking(positions, options.into())?;
-        Ok(RenderRegionData {
+            self.query_chunk_data_with_stats_blocking(positions, options.into())?;
+        Ok(WorldChunkQueryRegionData {
             region,
             chunks,
             stats,
@@ -2750,12 +2992,12 @@ where
     /// List render chunk positions in region.
     pub async fn list_render_chunk_positions_in_region(
         &self,
-        region: RenderChunkRegion,
+        region: WorldChunkQueryRegion,
         options: WorldScanOptions,
     ) -> Result<Vec<ChunkPos>> {
         let world = self.blocking_clone();
         tokio::task::spawn_blocking(move || {
-            world.list_render_chunk_positions_in_region_blocking(region, options)
+            world.list_chunk_positions_in_region_blocking(region, options)
         })
         .await
         .map_err(|error| BedrockWorldError::Join(error.to_string()))?
@@ -2816,10 +3058,10 @@ where
     pub async fn load_render_chunk(
         &self,
         pos: ChunkPos,
-        options: RenderChunkLoadOptions,
-    ) -> Result<RenderChunkData> {
+        options: ChunkLoadOptions,
+    ) -> Result<ChunkData> {
         let world = self.blocking_clone();
-        tokio::task::spawn_blocking(move || world.load_render_chunk_blocking(pos, options))
+        tokio::task::spawn_blocking(move || world.query_chunk_data_blocking(pos, options))
             .await
             .map_err(|error| BedrockWorldError::Join(error.to_string()))?
     }
@@ -2829,23 +3071,25 @@ where
     pub async fn load_render_chunks(
         &self,
         positions: Vec<ChunkPos>,
-        options: RenderChunkLoadOptions,
-    ) -> Result<Vec<RenderChunkData>> {
+        options: ChunkLoadOptions,
+    ) -> Result<Vec<ChunkData>> {
         let world = self.blocking_clone();
-        tokio::task::spawn_blocking(move || world.load_render_chunks_blocking(positions, options))
-            .await
-            .map_err(|error| BedrockWorldError::Join(error.to_string()))?
+        tokio::task::spawn_blocking(move || {
+            world.query_chunk_data_many_blocking(positions, options)
+        })
+        .await
+        .map_err(|error| BedrockWorldError::Join(error.to_string()))?
     }
 
     #[cfg(feature = "async")]
     /// Load render region.
     pub async fn load_render_region(
         &self,
-        region: RenderChunkRegion,
-        options: RenderRegionLoadOptions,
-    ) -> Result<RenderRegionData> {
+        region: WorldChunkQueryRegion,
+        options: WorldChunkQueryRegionLoadOptions,
+    ) -> Result<WorldChunkQueryRegionData> {
         let world = self.blocking_clone();
-        tokio::task::spawn_blocking(move || world.load_render_region_blocking(region, options))
+        tokio::task::spawn_blocking(move || world.query_chunk_region_blocking(region, options))
             .await
             .map_err(|error| BedrockWorldError::Join(error.to_string()))?
     }
@@ -3483,7 +3727,7 @@ fn emit_progress(options: &WorldScanOptions, entries_seen: usize) {
     }
 }
 
-fn check_render_load_cancelled(options: &RenderChunkLoadOptions) -> Result<()> {
+fn check_render_load_cancelled(options: &ChunkLoadOptions) -> Result<()> {
     if options
         .cancel
         .as_ref()
@@ -3496,7 +3740,7 @@ fn check_render_load_cancelled(options: &RenderChunkLoadOptions) -> Result<()> {
     Ok(())
 }
 
-fn emit_render_load_progress(options: &RenderChunkLoadOptions, completed_chunks: usize) {
+fn emit_render_load_progress(options: &ChunkLoadOptions, completed_chunks: usize) {
     if completed_chunks.is_multiple_of(options.pipeline.resolve_progress_interval()) {
         if let Some(progress) = &options.progress {
             progress.emit(WorldScanProgress {
@@ -3506,10 +3750,10 @@ fn emit_render_load_progress(options: &RenderChunkLoadOptions, completed_chunks:
     }
 }
 
-fn sort_render_chunk_positions(positions: &mut [ChunkPos], priority: RenderChunkPriority) {
+fn sort_render_chunk_positions(positions: &mut [ChunkPos], priority: ChunkLoadPriority) {
     match priority {
-        RenderChunkPriority::RowMajor => positions.sort(),
-        RenderChunkPriority::DistanceFrom { chunk_x, chunk_z } => positions.sort_by_key(|pos| {
+        ChunkLoadPriority::RowMajor => positions.sort(),
+        ChunkLoadPriority::DistanceFrom { chunk_x, chunk_z } => positions.sort_by_key(|pos| {
             let dx = i64::from(pos.x) - i64::from(chunk_x);
             let dz = i64::from(pos.z) - i64::from(chunk_z);
             (
@@ -3544,7 +3788,7 @@ fn push_render_record_request(
 }
 
 fn apply_render_record_values(
-    chunks: &mut [RawRenderChunkData],
+    chunks: &mut [RawChunkData],
     requests: &[RenderRecordRequest],
     values: Vec<Option<Bytes>>,
 ) -> usize {
@@ -3584,14 +3828,15 @@ fn apply_render_record_values(
 
 fn planned_render_subchunk_ys(
     pos: ChunkPos,
-    options: &RenderChunkLoadOptions,
+    options: &ChunkLoadOptions,
     height_map: Option<&[[Option<i16>; 16]; 16]>,
 ) -> Result<BTreeSet<i8>> {
     let mut subchunk_ys = BTreeSet::new();
-    match options.request {
-        RenderChunkRequest::ExactSurface { subchunks, .. } => {
-            let (min_y, max_y) = pos.subchunk_index_range(crate::ChunkVersion::New);
-            match subchunks {
+    let request = options.data_request.clone();
+    let (min_y, max_y) = pos.subchunk_index_range(crate::ChunkVersion::New);
+    for requirement in request.subchunks {
+        match requirement {
+            SubchunkDataRequirement::SurfaceColumns(subchunks) => match subchunks {
                 ExactSurfaceSubchunkPolicy::Full => {
                     for y in min_y..=max_y {
                         subchunk_ys.insert(y);
@@ -3611,85 +3856,86 @@ fn planned_render_subchunk_ys(
                         }
                     }
                 }
+            },
+            SubchunkDataRequirement::Layer(y) | SubchunkDataRequirement::CaveSlice(y) => {
+                subchunk_ys.insert(block_y_to_subchunk_y(y)?);
+            }
+            SubchunkDataRequirement::Full3dIndices => {
+                for y in min_y..=max_y {
+                    subchunk_ys.insert(y);
+                }
             }
         }
-        RenderChunkRequest::Layer { y } => {
-            subchunk_ys.insert(block_y_to_subchunk_y(y)?);
-        }
-        RenderChunkRequest::RawHeightMap | RenderChunkRequest::Biome { .. } => {}
     }
     Ok(subchunk_ys)
 }
 
-const fn request_needs_biome_record(request: RenderChunkRequest) -> bool {
-    match request {
-        RenderChunkRequest::ExactSurface { biome, .. } => {
-            !matches!(biome, ExactSurfaceBiomeLoad::None)
+fn request_needs_biome_record(options: &ChunkLoadOptions) -> bool {
+    let request = &options.data_request;
+    request.height_map || !matches!(request.biome, BiomeDataRequirement::None)
+}
+
+fn request_needs_legacy_terrain(options: &ChunkLoadOptions) -> bool {
+    options.data_request.height_map
+        || request_builds_column_samples(options)
+        || !matches!(options.data_request.biome, BiomeDataRequirement::None)
+}
+
+fn request_needs_legacy_terrain_fallback(options: &ChunkLoadOptions) -> bool {
+    !request_needs_legacy_terrain(options) && !options.data_request.subchunks.is_empty()
+}
+
+fn request_loads_block_entities(options: &ChunkLoadOptions) -> bool {
+    options.data_request.block_entities
+}
+
+fn request_builds_column_samples(options: &ChunkLoadOptions) -> bool {
+    options
+        .data_request
+        .subchunks
+        .iter()
+        .any(|requirement| matches!(requirement, SubchunkDataRequirement::SurfaceColumns(_)))
+}
+
+fn request_uses_hint_surface_subchunks(options: &ChunkLoadOptions) -> bool {
+    options.data_request.subchunks.iter().any(|requirement| {
+        matches!(
+            requirement,
+            SubchunkDataRequirement::SurfaceColumns(ExactSurfaceSubchunkPolicy::HintThenVerify)
+        )
+    })
+}
+
+fn exact_surface_full_request(options: &mut ChunkLoadOptions) {
+    let mut request = options.data_request.clone();
+    for requirement in &mut request.subchunks {
+        if matches!(
+            requirement,
+            SubchunkDataRequirement::SurfaceColumns(ExactSurfaceSubchunkPolicy::HintThenVerify)
+        ) {
+            *requirement =
+                SubchunkDataRequirement::SurfaceColumns(ExactSurfaceSubchunkPolicy::Full);
         }
-        RenderChunkRequest::RawHeightMap | RenderChunkRequest::Biome { .. } => true,
-        RenderChunkRequest::Layer { .. } => false,
     }
-}
-
-const fn request_loads_block_entities(request: RenderChunkRequest) -> bool {
-    matches!(
-        request,
-        RenderChunkRequest::ExactSurface {
-            block_entities: true,
-            ..
-        }
-    )
-}
-
-const fn request_builds_column_samples(request: RenderChunkRequest) -> bool {
-    matches!(request, RenderChunkRequest::ExactSurface { .. })
-}
-
-const fn request_uses_hint_surface_subchunks(request: RenderChunkRequest) -> bool {
-    matches!(
-        request,
-        RenderChunkRequest::ExactSurface {
-            subchunks: ExactSurfaceSubchunkPolicy::HintThenVerify,
-            ..
-        }
-    )
-}
-
-const fn exact_surface_full_request(request: RenderChunkRequest) -> RenderChunkRequest {
-    match request {
-        RenderChunkRequest::ExactSurface {
-            biome,
-            block_entities,
-            ..
-        } => RenderChunkRequest::ExactSurface {
-            subchunks: ExactSurfaceSubchunkPolicy::Full,
-            biome,
-            block_entities,
-        },
-        other => other,
-    }
+    options.data_request = request;
 }
 
 fn insert_render_biome_storages(
     render_biomes: &mut BTreeMap<i32, ParsedBiomeStorage>,
     biome_data: Option<ParsedBiomeData>,
-    request: RenderChunkRequest,
+    request: &ChunkDataRequest,
 ) {
     let Some(biome_data) = biome_data else {
         return;
     };
-    match request {
-        RenderChunkRequest::ExactSurface {
-            biome: ExactSurfaceBiomeLoad::TopColumns | ExactSurfaceBiomeLoad::All,
-            ..
-        }
-        | RenderChunkRequest::Biome { load_all: true, .. } => {
+    match request.biome {
+        BiomeDataRequirement::SurfaceColumns | BiomeDataRequirement::All => {
             for storage in biome_data.storages {
                 let key = storage.y.unwrap_or(i32::MIN);
                 render_biomes.insert(key, storage);
             }
         }
-        RenderChunkRequest::Biome { y, load_all: false } => {
+        BiomeDataRequirement::Layer(y) => {
             let mut fallback = None;
             for storage in biome_data.storages {
                 if biome_storage_contains_y(&storage, y) {
@@ -3702,12 +3948,7 @@ fn insert_render_biome_storages(
                 render_biomes.insert(biome_storage_bucket_y(y), storage);
             }
         }
-        RenderChunkRequest::ExactSurface {
-            biome: ExactSurfaceBiomeLoad::None,
-            ..
-        }
-        | RenderChunkRequest::RawHeightMap
-        | RenderChunkRequest::Layer { .. } => {}
+        BiomeDataRequirement::None => {}
     }
 }
 
@@ -3796,6 +4037,77 @@ fn render_biome_colors_from_legacy_terrain(terrain: &LegacyTerrain) -> [[Option<
     colors
 }
 
+struct SurfaceProjection<'a> {
+    min_subchunk_y: i8,
+    subchunks: Vec<Option<&'a SubChunk>>,
+    roles: Vec<Option<Vec<Vec<TerrainSurfaceRole>>>>,
+}
+
+impl<'a> SurfaceProjection<'a> {
+    fn new(subchunks: &'a BTreeMap<i8, SubChunk>) -> Option<Self> {
+        let (&min_subchunk_y, _) = subchunks.first_key_value()?;
+        let (&max_subchunk_y, _) = subchunks.last_key_value()?;
+        let span = i16::from(max_subchunk_y)
+            .saturating_sub(i16::from(min_subchunk_y))
+            .saturating_add(1);
+        let len = usize::try_from(span).ok()?;
+        let mut projected = vec![None; len];
+        let mut roles = vec![None; len];
+        for (&y, subchunk) in subchunks {
+            let index = i16::from(y).saturating_sub(i16::from(min_subchunk_y));
+            if let Ok(index) = usize::try_from(index) {
+                if let Some(slot) = projected.get_mut(index) {
+                    *slot = Some(subchunk);
+                    roles[index] = match &subchunk.format {
+                        crate::chunk::SubChunkFormat::Paletted { storages, .. } => Some(
+                            storages
+                                .iter()
+                                .map(|storage| {
+                                    storage
+                                        .states
+                                        .iter()
+                                        .map(|state| terrain_surface_role(&state.name))
+                                        .collect()
+                                })
+                                .collect(),
+                        ),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        Some(Self {
+            min_subchunk_y,
+            subchunks: projected,
+            roles,
+        })
+    }
+
+    fn get(&self, y: i8) -> Option<&'a SubChunk> {
+        let index = i16::from(y).checked_sub(i16::from(self.min_subchunk_y))?;
+        self.subchunks
+            .get(usize::try_from(index).ok()?)?
+            .as_ref()
+            .copied()
+    }
+
+    fn role_for(
+        &self,
+        y: i8,
+        storage_index: usize,
+        palette_index: usize,
+    ) -> Option<TerrainSurfaceRole> {
+        let index =
+            usize::try_from(i16::from(y).checked_sub(i16::from(self.min_subchunk_y))?).ok()?;
+        self.roles
+            .get(index)?
+            .as_ref()?
+            .get(storage_index)?
+            .get(palette_index)
+            .copied()
+    }
+}
+
 fn build_terrain_column_samples(
     pos: ChunkPos,
     version: crate::ChunkVersion,
@@ -3806,6 +4118,7 @@ fn build_terrain_column_samples(
     render_biomes: &BTreeMap<i32, ParsedBiomeStorage>,
 ) -> Result<TerrainColumnSamples> {
     let mut columns = TerrainColumnSamples::new();
+    let projection = SurfaceProjection::new(subchunks);
     let (min_y, max_y) = if legacy_terrain.is_some() && subchunks.is_empty() {
         (0, 127)
     } else {
@@ -3820,6 +4133,7 @@ fn build_terrain_column_samples(
                 min_y,
                 max_y,
                 subchunks,
+                projection.as_ref(),
                 legacy_terrain,
                 height_map,
                 legacy_biomes,
@@ -3840,6 +4154,7 @@ fn sample_column_top_down(
     min_y: i32,
     max_y: i32,
     subchunks: &BTreeMap<i8, SubChunk>,
+    projection: Option<&SurfaceProjection<'_>>,
     legacy_terrain: Option<&LegacyTerrain>,
     height_map: Option<&[[Option<i16>; 16]; 16]>,
     legacy_biomes: Option<&[[Option<LegacyBiomeSample>; 16]; 16]>,
@@ -3856,15 +4171,21 @@ fn sample_column_top_down(
             BedrockWorldError::Validation(format!("block y={y} has invalid local subchunk offset"))
         })?;
         let mut saw_subchunk_layer = false;
-        if let Some(subchunk) = subchunks.get(&subchunk_y) {
-            for state in subchunk.visible_block_states_at(local_x, local_y, local_z) {
+        if let Some(subchunk) = projection.and_then(|projection| projection.get(subchunk_y)) {
+            for entry in subchunk.visible_block_surface_states_at(local_x, local_y, local_z) {
                 saw_subchunk_layer = true;
+                let role = projection
+                    .and_then(|projection| {
+                        projection.role_for(subchunk_y, entry.storage_index, entry.palette_index)
+                    })
+                    .unwrap_or_else(|| terrain_surface_role(&entry.state.name));
                 if let Some(sample) = scan_terrain_surface_state(
                     local_x,
                     local_z,
                     y,
                     height,
-                    state.clone(),
+                    entry.state,
+                    role,
                     TerrainSampleSource::Subchunk,
                     &mut overlay,
                     &mut top_water,
@@ -3882,12 +4203,15 @@ fn sample_column_top_down(
                 let data = subchunk
                     .legacy_block_data_at(local_x, local_y, local_z)
                     .unwrap_or(0);
+                let state = legacy_world_block_state(id, data);
+                let role = terrain_surface_role(&state.name);
                 if let Some(sample) = scan_terrain_surface_state(
                     local_x,
                     local_z,
                     y,
                     height,
-                    legacy_world_block_state(id, data),
+                    &state,
+                    role,
                     TerrainSampleSource::Subchunk,
                     &mut overlay,
                     &mut top_water,
@@ -3904,12 +4228,14 @@ fn sample_column_top_down(
         if let Some((state, source)) =
             legacy_terrain_block_state_at(local_x, y, local_z, subchunks, legacy_terrain)
         {
+            let role = terrain_surface_role(&state.name);
             if let Some(sample) = scan_terrain_surface_state(
                 local_x,
                 local_z,
                 y,
                 height,
-                state,
+                &state,
+                role,
                 source,
                 &mut overlay,
                 &mut top_water,
@@ -3959,7 +4285,8 @@ fn scan_terrain_surface_state(
     local_z: u8,
     y: i32,
     height: i16,
-    state: BlockState,
+    state: &BlockState,
+    role: TerrainSurfaceRole,
     source: TerrainSampleSource,
     overlay: &mut Option<TerrainColumnOverlay>,
     top_water: &mut Option<(i16, BlockState, TerrainSampleSource)>,
@@ -3967,7 +4294,7 @@ fn scan_terrain_surface_state(
     legacy_biomes: Option<&[[Option<LegacyBiomeSample>; 16]; 16]>,
     render_biomes: &BTreeMap<i32, ParsedBiomeStorage>,
 ) -> Option<TerrainColumnSample> {
-    match terrain_surface_role(&state.name) {
+    match role {
         TerrainSurfaceRole::Air => {
             if top_water.is_some() {
                 *water_depth = (*water_depth).saturating_add(1);
@@ -3988,7 +4315,7 @@ fn scan_terrain_surface_state(
                         block_state: water_state,
                         depth: (*water_depth).saturating_add(1),
                         underwater_y: Some(height),
-                        underwater_block_state: Some(state),
+                        underwater_block_state: Some(state.clone()),
                         source: water_source,
                     }),
                     biome,
@@ -3998,7 +4325,7 @@ fn scan_terrain_surface_state(
             if overlay.is_none() {
                 *overlay = Some(TerrainColumnOverlay {
                     y: height,
-                    block_state: state,
+                    block_state: state.clone(),
                     source,
                 });
             }
@@ -4006,7 +4333,7 @@ fn scan_terrain_surface_state(
         }
         TerrainSurfaceRole::Water => {
             if top_water.is_none() {
-                *top_water = Some((height, state, source));
+                *top_water = Some((height, state.clone(), source));
             } else {
                 *water_depth = (*water_depth).saturating_add(1);
             }
@@ -4026,7 +4353,7 @@ fn scan_terrain_surface_state(
                         block_state: water_state,
                         depth: (*water_depth).saturating_add(1),
                         underwater_y: Some(height),
-                        underwater_block_state: Some(state),
+                        underwater_block_state: Some(state.clone()),
                         source: water_source,
                     }),
                     biome,
@@ -4037,7 +4364,7 @@ fn scan_terrain_surface_state(
                 surface_y: height,
                 surface_block_state: state.clone(),
                 relief_y: height,
-                relief_block_state: state,
+                relief_block_state: state.clone(),
                 overlay: overlay.take(),
                 water: None,
                 biome,
@@ -4124,10 +4451,10 @@ fn render_biome_id_at(
 }
 
 fn render_chunk_from_raw(
-    raw: RawRenderChunkData,
-    options: &RenderChunkLoadOptions,
-) -> Result<(RenderChunkData, RenderChunkDecodeTiming)> {
-    let mut timing = RenderChunkDecodeTiming::default();
+    raw: RawChunkData,
+    options: &ChunkLoadOptions,
+) -> Result<(ChunkData, ChunkDecodeTiming)> {
+    let mut timing = ChunkDecodeTiming::default();
     let biome_started = Instant::now();
     let legacy_terrain = raw.legacy_terrain.map(LegacyTerrain::parse).transpose()?;
     let version = raw.biome_record.as_ref().map_or_else(
@@ -4156,22 +4483,21 @@ fn render_chunk_from_raw(
         .as_ref()
         .map(render_biome_colors_from_legacy_terrain);
     let mut render_biomes = BTreeMap::new();
-    insert_render_biome_storages(&mut render_biomes, biome_data, options.request);
-    timing.biome_parse_ms = biome_started.elapsed().as_millis();
+    let data_request = &options.data_request;
+    insert_render_biome_storages(&mut render_biomes, biome_data, &data_request);
+    timing.biome_parse_us = biome_started.elapsed().as_micros();
 
     let mut subchunks = BTreeMap::new();
     let subchunk_started = Instant::now();
+    let subchunk_decode = options.data_request.preferred_decode_mode();
     for (y, value) in raw.subchunks {
         check_render_load_cancelled(options)?;
-        subchunks.insert(
-            y,
-            parse_subchunk_with_mode(y, value, options.subchunk_decode)?,
-        );
+        subchunks.insert(y, parse_subchunk_with_mode(y, value, subchunk_decode)?);
     }
-    timing.subchunk_parse_ms = subchunk_started.elapsed().as_millis();
+    timing.subchunk_parse_us = subchunk_started.elapsed().as_micros();
 
     let block_entity_started = Instant::now();
-    let block_entities = if request_loads_block_entities(options.request) {
+    let block_entities = if request_loads_block_entities(options) {
         if let Some(value) = raw.block_entities {
             let mut report = WorldParseReport::default();
             parse_block_entities_from_value(&value, &mut report)
@@ -4184,10 +4510,10 @@ fn render_chunk_from_raw(
     } else {
         Vec::new()
     };
-    timing.block_entity_parse_ms = block_entity_started.elapsed().as_millis();
+    timing.block_entity_parse_us = block_entity_started.elapsed().as_micros();
 
     let surface_scan_started = Instant::now();
-    let column_samples = if request_builds_column_samples(options.request) {
+    let column_samples = if request_builds_column_samples(options) {
         Some(build_terrain_column_samples(
             raw.pos,
             version,
@@ -4200,10 +4526,10 @@ fn render_chunk_from_raw(
     } else {
         None
     };
-    timing.surface_scan_ms = surface_scan_started.elapsed().as_millis();
+    timing.surface_scan_us = surface_scan_started.elapsed().as_micros();
 
     Ok((
-        RenderChunkData {
+        ChunkData {
             pos: raw.pos,
             is_loaded: height_map.is_some()
                 || legacy_biome_colors.is_some()
@@ -4227,12 +4553,12 @@ fn render_chunk_from_raw(
 }
 
 fn render_load_stats(
-    chunks: &[RenderChunkData],
+    chunks: &[ChunkData],
     worker_threads: usize,
     queue_wait_ms: u128,
     load_ms: u128,
-) -> RenderLoadStats {
-    RenderLoadStats {
+) -> ChunkLoadStats {
+    ChunkLoadStats {
         requested_chunks: chunks.len(),
         loaded_chunks: chunks.iter().filter(|chunk| chunk.is_loaded).count(),
         subchunks_decoded: chunks
@@ -4249,9 +4575,13 @@ fn render_load_stats(
         decode_ms: 0,
         db_read_ms: 0,
         biome_parse_ms: 0,
+        biome_parse_us: 0,
         subchunk_parse_ms: 0,
+        subchunk_parse_us: 0,
         surface_scan_ms: 0,
+        surface_scan_us: 0,
         block_entity_parse_ms: 0,
+        block_entity_parse_us: 0,
         full_reload_ms: 0,
         legacy_terrain_records: chunks
             .iter()
@@ -4304,7 +4634,7 @@ fn render_load_stats(
     }
 }
 
-fn log_render_load_complete(stats: &RenderLoadStats) {
+fn log_render_load_complete(stats: &ChunkLoadStats) {
     log::debug!(
         "render chunk load complete (requested_chunks={}, loaded_chunks={}, missing_chunks={}, subchunks_decoded={}, legacy_terrain_records={}, legacy_biome_samples={}, legacy_biome_colors={}, terrain_source_legacy={}, terrain_source_subchunk={}, legacy_pocket_chunks={}, detected_format={:?}, computed_surface_columns={}, raw_height_mismatch_columns={}, missing_subchunk_columns={}, legacy_fallback_columns={}, legacy_biome_preferred_columns={}, modern_biome_fallback_columns={}, worker_threads={}, queue_wait_ms={}, load_ms={}, exact_get_batches={}, keys_requested={}, keys_found={}, prefix_scans={}, db_read_ms={}, decode_ms={}, biome_parse_ms={}, subchunk_parse_ms={}, surface_scan_ms={}, block_entity_parse_ms={}, full_reload_ms={})",
         stats.requested_chunks,
@@ -4364,6 +4694,7 @@ fn to_storage_read_options(options: &WorldScanOptions) -> StorageReadOptions {
                 StorageScanMode::ParallelTables
             }
         },
+        cache_policy: StorageCachePolicy::Bypass,
         pipeline: crate::storage::StoragePipelineOptions {
             queue_depth: options.pipeline.queue_depth,
             table_batch_size: options.pipeline.chunk_batch_size,
@@ -4384,6 +4715,25 @@ fn to_storage_read_options(options: &WorldScanOptions) -> StorageReadOptions {
     }
 }
 
+fn to_render_storage_read_options(options: &ChunkLoadOptions) -> StorageReadOptions {
+    StorageReadOptions {
+        threading: match options.threading {
+            WorldThreadingOptions::Auto => StorageThreadingOptions::Auto,
+            WorldThreadingOptions::Fixed(threads) => StorageThreadingOptions::Fixed(threads),
+            WorldThreadingOptions::Single => StorageThreadingOptions::Single,
+        },
+        scan_mode: StorageScanMode::Sequential,
+        cache_policy: options.storage_cache_policy,
+        pipeline: crate::storage::StoragePipelineOptions {
+            queue_depth: options.pipeline.queue_depth,
+            table_batch_size: options.pipeline.chunk_batch_size,
+            progress_interval: options.pipeline.progress_interval,
+        },
+        cancel: options.cancel.as_ref().map(CancelFlag::to_storage_cancel),
+        progress: None,
+    }
+}
+
 fn chunk_record_prefix(pos: ChunkPos) -> Bytes {
     let mut bytes = Vec::with_capacity(if pos.dimension == crate::Dimension::Overworld {
         8
@@ -4398,7 +4748,7 @@ fn chunk_record_prefix(pos: ChunkPos) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn validate_render_region(region: RenderChunkRegion) -> Result<()> {
+fn validate_render_region(region: WorldChunkQueryRegion) -> Result<()> {
     if region.min_chunk_x > region.max_chunk_x || region.min_chunk_z > region.max_chunk_z {
         return Err(BedrockWorldError::Validation(format!(
             "invalid render region: min=({}, {}) max=({}, {})",
@@ -4408,12 +4758,12 @@ fn validate_render_region(region: RenderChunkRegion) -> Result<()> {
     Ok(())
 }
 
-fn render_block_entity_from_nbt(nbt: NbtTag) -> RenderBlockEntity {
+fn render_block_entity_from_nbt(nbt: NbtTag) -> ChunkBlockEntity {
     let root = match &nbt {
         NbtTag::Compound(root) => Some(root),
         _ => None,
     };
-    RenderBlockEntity {
+    ChunkBlockEntity {
         id: root
             .and_then(|root| nbt_string_field(root, "id"))
             .map(ToString::to_string),
@@ -4506,9 +4856,67 @@ fn detect_leveldb_world_format(path: &Path) -> WorldFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Dimension, HardcodedSpawnAreaKind, MemoryStorage, NbtTag, block_storage_index};
+    use crate::{
+        Dimension, HardcodedSpawnAreaKind, MemoryStorage, NbtTag, StorageBatch, StorageReadOptions,
+        StorageScanOutcome, block_storage_index,
+    };
     use indexmap::IndexMap;
     use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct KeyOnlyPlayerStorage;
+
+    impl WorldStorage for KeyOnlyPlayerStorage {
+        fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+            Ok(None)
+        }
+
+        fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+            Err(BedrockWorldError::ReadOnly)
+        }
+
+        fn delete(&self, _key: &[u8]) -> Result<()> {
+            Err(BedrockWorldError::ReadOnly)
+        }
+
+        fn for_each_key(
+            &self,
+            _options: StorageReadOptions,
+            _visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
+        ) -> Result<StorageScanOutcome> {
+            Ok(StorageScanOutcome::empty())
+        }
+
+        fn for_each_prefix(
+            &self,
+            _prefix: &[u8],
+            _options: StorageReadOptions,
+            _visitor: &mut (dyn FnMut(&[u8], &Bytes) -> Result<StorageVisitorControl> + Send),
+        ) -> Result<StorageScanOutcome> {
+            Err(BedrockWorldError::Validation(
+                "player listing requested values".to_string(),
+            ))
+        }
+
+        fn for_each_prefix_key(
+            &self,
+            prefix: &[u8],
+            _options: StorageReadOptions,
+            visitor: &mut (dyn FnMut(&[u8]) -> Result<StorageVisitorControl> + Send),
+        ) -> Result<StorageScanOutcome> {
+            assert_eq!(prefix, b"player_");
+            let _ = visitor(b"player_12345")?;
+            Ok(StorageScanOutcome::empty())
+        }
+
+        fn write_batch(&self, _batch: &StorageBatch) -> Result<()> {
+            Err(BedrockWorldError::ReadOnly)
+        }
+
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[cfg(feature = "backend-bedrock-leveldb")]
     fn temp_world_dir(name: &str) -> PathBuf {
@@ -4523,16 +4931,33 @@ mod tests {
         ))
     }
 
-    const fn exact_surface_request(
+    fn exact_surface_request(
         subchunks: ExactSurfaceSubchunkPolicy,
         biome: ExactSurfaceBiomeLoad,
         block_entities: bool,
-    ) -> RenderChunkRequest {
-        RenderChunkRequest::ExactSurface {
-            subchunks,
-            biome,
-            block_entities,
-        }
+    ) -> ChunkDataRequest {
+        ChunkDataRequest::new()
+            .surface_columns(subchunks)
+            .biome(match biome {
+                ExactSurfaceBiomeLoad::None => BiomeDataRequirement::None,
+                ExactSurfaceBiomeLoad::TopColumns => BiomeDataRequirement::SurfaceColumns,
+                ExactSurfaceBiomeLoad::All => BiomeDataRequirement::All,
+            })
+            .block_entities_if(block_entities)
+    }
+
+    #[test]
+    fn player_listing_uses_key_only_prefix_scan() {
+        let world = BedrockWorld::from_typed_storage(
+            "memory",
+            KeyOnlyPlayerStorage,
+            OpenOptions::default(),
+        );
+
+        assert_eq!(
+            world.list_players_blocking().expect("list players"),
+            vec![PlayerId::Xuid("12345".to_string())]
+        );
     }
 
     #[test]
@@ -4778,7 +5203,7 @@ mod tests {
 
         sort_render_chunk_positions(
             &mut positions,
-            RenderChunkPriority::DistanceFrom {
+            ChunkLoadPriority::DistanceFrom {
                 chunk_x: 0,
                 chunk_z: 0,
             },
@@ -4977,11 +5402,11 @@ mod tests {
             Some(66)
         );
         let chunk = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: RenderChunkRequest::RawHeightMap,
-                    ..RenderChunkLoadOptions::default()
+                ChunkLoadOptions {
+                    data_request: ChunkDataRequest::new().height_map(),
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("load render chunk");
@@ -5010,7 +5435,7 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(pos, RenderChunkLoadOptions::default())
+            .query_chunk_data_blocking(pos, ChunkLoadOptions::default())
             .expect("load render chunk");
         let height_map = chunk.height_map.as_ref().expect("height map");
         let biome_storage = chunk
@@ -5068,28 +5493,28 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let needed = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::HintThenVerify,
                         ExactSurfaceBiomeLoad::TopColumns,
                         false,
                     ),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("needed render chunk");
         let full = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::Full,
                         ExactSurfaceBiomeLoad::TopColumns,
                         false,
                     ),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("full render chunk");
@@ -5127,15 +5552,15 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::HintThenVerify,
                         ExactSurfaceBiomeLoad::TopColumns,
                         false,
                     ),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("needed render chunk");
@@ -5179,15 +5604,15 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::HintThenVerify,
                         ExactSurfaceBiomeLoad::TopColumns,
                         false,
                     ),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("needed render chunk");
@@ -5236,15 +5661,15 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::HintThenVerify,
                         ExactSurfaceBiomeLoad::TopColumns,
                         false,
                     ),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("needed render chunk");
@@ -5280,11 +5705,11 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: RenderChunkRequest::RawHeightMap,
-                    ..RenderChunkLoadOptions::default()
+                ChunkLoadOptions {
+                    data_request: ChunkDataRequest::new().height_map(),
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("load raw heightmap chunk");
@@ -5311,15 +5736,15 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::HintThenVerify,
                         ExactSurfaceBiomeLoad::TopColumns,
                         false,
                     ),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("needed render chunk");
@@ -5355,18 +5780,18 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let without_entities = world
-            .load_render_chunk_blocking(pos, RenderChunkLoadOptions::default())
+            .query_chunk_data_blocking(pos, ChunkLoadOptions::default())
             .expect("load render chunk without block entities");
         let with_entities = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::Full,
                         ExactSurfaceBiomeLoad::TopColumns,
                         true,
                     ),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("load render chunk with block entities");
@@ -5520,8 +5945,8 @@ mod tests {
 
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
         let visible = world
-            .list_render_chunk_positions_in_region_blocking(
-                RenderChunkRegion {
+            .list_chunk_positions_in_region_blocking(
+                WorldChunkQueryRegion {
                     dimension: Dimension::Overworld,
                     min_chunk_x: 0,
                     min_chunk_z: 0,
@@ -5538,11 +5963,11 @@ mod tests {
         assert_eq!(visible, render_positions.to_vec());
 
         let chunks = world
-            .load_render_chunks_blocking(
+            .query_chunk_data_many_blocking(
                 visible,
-                RenderChunkLoadOptions {
+                ChunkLoadOptions {
                     threading: WorldThreadingOptions::Fixed(2),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("parallel render chunk load");
@@ -5574,8 +5999,8 @@ mod tests {
         );
 
         let positions = world
-            .list_render_chunk_positions_in_region_blocking(
-                RenderChunkRegion {
+            .list_chunk_positions_in_region_blocking(
+                WorldChunkQueryRegion {
                     dimension: Dimension::Overworld,
                     min_chunk_x: 0,
                     min_chunk_z: 0,
@@ -5588,11 +6013,11 @@ mod tests {
         assert_eq!(positions, vec![pos]);
 
         let (chunks, stats) = world
-            .load_render_chunks_with_stats_blocking(
+            .query_chunk_data_with_stats_blocking(
                 positions,
-                RenderChunkLoadOptions {
+                ChunkLoadOptions {
                     threading: WorldThreadingOptions::Single,
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("legacy exact render load");
@@ -5640,16 +6065,16 @@ mod tests {
         );
 
         let (chunks, stats) = world
-            .load_render_chunks_with_stats_blocking(
+            .query_chunk_data_with_stats_blocking(
                 [pos],
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::Full,
                         ExactSurfaceBiomeLoad::All,
                         false,
                     ),
                     threading: WorldThreadingOptions::Single,
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("load conflicting legacy render chunk");
@@ -5693,16 +6118,16 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let (chunks, stats) = world
-            .load_render_chunks_with_stats_blocking(
+            .query_chunk_data_with_stats_blocking(
                 [pos],
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::Full,
                         ExactSurfaceBiomeLoad::All,
                         false,
                     ),
                     threading: WorldThreadingOptions::Single,
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("load modern render chunk");
@@ -5742,7 +6167,7 @@ mod tests {
         );
 
         let chunk = world
-            .load_render_chunk_blocking(pos, RenderChunkLoadOptions::default())
+            .query_chunk_data_blocking(pos, ChunkLoadOptions::default())
             .expect("load legacy render chunk");
         let colors = chunk.legacy_biome_colors.expect("legacy biome colors");
         let samples = chunk.legacy_biomes.expect("legacy biome samples");
@@ -5792,15 +6217,15 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let (chunks, stats) = world
-            .load_render_chunks_with_stats_blocking(
+            .query_chunk_data_with_stats_blocking(
                 [pos],
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::Full,
                         ExactSurfaceBiomeLoad::TopColumns,
                         false,
                     ),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("load mixed render chunk");
@@ -5836,15 +6261,15 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let (chunks, stats) = world
-            .load_render_chunks_with_stats_blocking(
+            .query_chunk_data_with_stats_blocking(
                 [pos],
-                RenderChunkLoadOptions {
-                    request: exact_surface_request(
+                ChunkLoadOptions {
+                    data_request: exact_surface_request(
                         ExactSurfaceSubchunkPolicy::Full,
                         ExactSurfaceBiomeLoad::TopColumns,
                         false,
                     ),
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("load exact surface chunk");
@@ -5857,6 +6282,128 @@ mod tests {
         assert_eq!(sample.source, TerrainSampleSource::Subchunk);
         assert_eq!(stats.computed_surface_columns, 256);
         assert_eq!(stats.raw_height_mismatch_columns, 256);
+    }
+
+    #[test]
+    fn exact_surface_columns_match_full_indices() {
+        let storage = Arc::new(MemoryStorage::new());
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                &test_data2d_bytes(1, 3),
+            )
+            .expect("put height map");
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 0).encode(),
+                &test_uniform_named_subchunk_bytes("minecraft:grass_block"),
+            )
+            .expect("put surface subchunk");
+        let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
+        let surface_request = exact_surface_request(
+            ExactSurfaceSubchunkPolicy::Full,
+            ExactSurfaceBiomeLoad::TopColumns,
+            false,
+        );
+        let full = world
+            .query_chunk_data_blocking(
+                pos,
+                ChunkLoadOptions {
+                    data_request: surface_request.clone().full_3d_indices(),
+                    ..ChunkLoadOptions::default()
+                },
+            )
+            .expect("load full indices");
+        let surface = world
+            .query_chunk_data_blocking(
+                pos,
+                ChunkLoadOptions {
+                    data_request: surface_request,
+                    ..ChunkLoadOptions::default()
+                },
+            )
+            .expect("load surface columns");
+
+        assert_eq!(full.column_samples, surface.column_samples);
+        let samples = world
+            .load_surface_columns_blocking(
+                pos,
+                ChunkLoadOptions::exact_surface_columns(
+                    ExactSurfaceSubchunkPolicy::Full,
+                    ExactSurfaceBiomeLoad::TopColumns,
+                    false,
+                ),
+            )
+            .expect("load surface samples")
+            .expect("surface samples");
+        assert_eq!(surface.column_samples.as_ref(), Some(&samples));
+    }
+
+    #[test]
+    fn specialized_render_load_options_select_the_minimal_decode_contract() {
+        let surface = ChunkLoadOptions::exact_surface_columns(
+            ExactSurfaceSubchunkPolicy::HintThenVerify,
+            ExactSurfaceBiomeLoad::TopColumns,
+            false,
+        );
+        assert!(matches!(
+            surface.data_request.subchunks.as_slice(),
+            [SubchunkDataRequirement::SurfaceColumns(
+                ExactSurfaceSubchunkPolicy::HintThenVerify
+            )]
+        ));
+        assert_eq!(
+            surface.data_request.preferred_decode_mode(),
+            SubChunkDecodeMode::SurfaceColumns
+        );
+
+        let layer = ChunkLoadOptions::layer(64);
+        assert!(matches!(
+            layer.data_request.subchunks.as_slice(),
+            [SubchunkDataRequirement::Layer(64)]
+        ));
+        assert_eq!(
+            layer.data_request.preferred_decode_mode(),
+            SubChunkDecodeMode::FullIndices
+        );
+
+        let height_map = ChunkLoadOptions::raw_height_map();
+        assert!(height_map.data_request.height_map);
+        assert_eq!(
+            height_map.data_request.preferred_decode_mode(),
+            SubChunkDecodeMode::CountsOnly
+        );
+    }
+
+    #[test]
+    fn composable_map_data_request_unions_subchunk_reads_and_decoder_needs() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let request = ChunkDataRequest::new().layer(0).cave_slice(31).height_map();
+        let options = ChunkLoadOptions::for_data_request(request.clone());
+        let planned = planned_render_subchunk_ys(pos, &options, None).expect("plan subchunks");
+        assert_eq!(planned.into_iter().collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(
+            request.preferred_decode_mode(),
+            SubChunkDecodeMode::FullIndices
+        );
+
+        let surface = ChunkDataRequest::new()
+            .surface_columns(ExactSurfaceSubchunkPolicy::HintThenVerify)
+            .biome(BiomeDataRequirement::SurfaceColumns);
+        assert_eq!(
+            surface.preferred_decode_mode(),
+            SubChunkDecodeMode::SurfaceColumns
+        );
+        assert!(!surface.height_map);
     }
 
     #[test]
@@ -5892,10 +6439,21 @@ mod tests {
             .expect("put overlay subchunk");
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
-        let chunk = world
-            .load_render_chunk_blocking(pos, RenderChunkLoadOptions::default())
+        let full = world
+            .query_chunk_data_blocking(pos, ChunkLoadOptions::default())
             .expect("load exact surface chunk");
-        let button = chunk.column_sample_at(0, 0).expect("button column");
+        let surface = world
+            .query_chunk_data_blocking(
+                pos,
+                ChunkLoadOptions {
+                    subchunk_decode: SubChunkDecodeMode::SurfaceColumns,
+                    ..ChunkLoadOptions::default()
+                },
+            )
+            .expect("load surface-column chunk");
+        assert_eq!(full.column_samples, surface.column_samples);
+
+        let button = surface.column_sample_at(0, 0).expect("button column");
         assert_eq!(button.surface_y, 0);
         assert_eq!(button.surface_block_state.name, "minecraft:grass_block");
         assert_eq!(
@@ -5905,15 +6463,15 @@ mod tests {
                 .map(|overlay| overlay.block_state.name.as_str()),
             Some("minecraft:stone_button")
         );
-        let carpet = chunk.column_sample_at(1, 0).expect("carpet column");
+        let carpet = surface.column_sample_at(1, 0).expect("carpet column");
         assert_eq!(carpet.surface_y, 1);
         assert_eq!(carpet.surface_block_state.name, "minecraft:red_carpet");
         assert!(carpet.overlay.is_none());
-        let snow = chunk.column_sample_at(2, 0).expect("snow column");
+        let snow = surface.column_sample_at(2, 0).expect("snow column");
         assert_eq!(snow.surface_y, 1);
         assert_eq!(snow.surface_block_state.name, "minecraft:snow_layer");
         assert!(snow.overlay.is_none());
-        let vine = chunk.column_sample_at(3, 0).expect("vine column");
+        let vine = surface.column_sample_at(3, 0).expect("vine column");
         assert_eq!(vine.surface_y, 0);
         assert_eq!(
             vine.overlay
@@ -5964,7 +6522,7 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(pos, RenderChunkLoadOptions::default())
+            .query_chunk_data_blocking(pos, ChunkLoadOptions::default())
             .expect("load exact surface chunk");
         let sample = chunk.column_sample_at(0, 0).expect("roof column");
 
@@ -6007,7 +6565,7 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(pos, RenderChunkLoadOptions::default())
+            .query_chunk_data_blocking(pos, ChunkLoadOptions::default())
             .expect("load exact surface chunk");
         let water = chunk.column_sample_at(0, 0).expect("water column");
         assert_eq!(water.surface_y, 0);
@@ -6054,7 +6612,7 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(pos, RenderChunkLoadOptions::default())
+            .query_chunk_data_blocking(pos, ChunkLoadOptions::default())
             .expect("load exact surface chunk");
         let sample = chunk.column_sample_at(0, 0).expect("water column");
         let water = sample.water.as_ref().expect("water context");
@@ -6090,11 +6648,11 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let chunk = world
-            .load_render_chunk_blocking(
+            .query_chunk_data_blocking(
                 pos,
-                RenderChunkLoadOptions {
-                    request: RenderChunkRequest::Layer { y: 10 },
-                    ..RenderChunkLoadOptions::default()
+                ChunkLoadOptions {
+                    data_request: ChunkDataRequest::new().layer(10),
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("load legacy subchunk render chunk");
@@ -6104,6 +6662,66 @@ mod tests {
         assert_eq!(subchunk.legacy_block_id_at(15, 10, 0), Some(12));
         assert_eq!(subchunk.legacy_block_id_at(0, 10, 15), Some(24));
         assert_eq!(subchunk.legacy_block_id_at(15, 10, 15), Some(45));
+    }
+
+    #[test]
+    fn layer_query_does_not_read_surface_fallback_records() {
+        let storage = Arc::new(MemoryStorage::new());
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 0).encode(),
+                &test_uniform_named_subchunk_bytes("minecraft:stone"),
+            )
+            .expect("put layer subchunk");
+        let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
+
+        let (chunks, stats) = world
+            .query_chunk_data_with_stats_blocking(
+                [pos],
+                ChunkLoadOptions::for_data_request(ChunkDataRequest::new().layer(0)),
+            )
+            .expect("query fixed layer");
+
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].subchunks.contains_key(&0));
+        assert_eq!(stats.keys_requested, 1);
+        assert_eq!(stats.keys_found, 1);
+        assert_eq!(stats.legacy_terrain_records, 0);
+    }
+
+    #[test]
+    fn chunk_query_defaults_to_reusing_storage_blocks() {
+        assert_eq!(
+            ChunkLoadOptions::default().storage_cache_policy,
+            StorageCachePolicy::Use
+        );
+    }
+
+    #[test]
+    fn decode_timing_preserves_sub_millisecond_samples() {
+        let mut total = ChunkDecodeTiming::default();
+        total.add(ChunkDecodeTiming {
+            biome_parse_us: 125,
+            subchunk_parse_us: 250,
+            surface_scan_us: 375,
+            block_entity_parse_us: 500,
+        });
+        total.add(ChunkDecodeTiming {
+            biome_parse_us: 875,
+            subchunk_parse_us: 750,
+            surface_scan_us: 625,
+            block_entity_parse_us: 500,
+        });
+
+        assert_eq!(total.biome_parse_us, 1_000);
+        assert_eq!(total.subchunk_parse_us, 1_000);
+        assert_eq!(total.surface_scan_us, 1_000);
+        assert_eq!(total.block_entity_parse_us, 1_000);
     }
 
     #[test]
@@ -6147,16 +6765,16 @@ mod tests {
         let world = BedrockWorld::from_storage("memory", storage, OpenOptions::default());
 
         let (chunks, stats) = world
-            .load_render_chunks_with_stats_blocking(
+            .query_chunk_data_with_stats_blocking(
                 vec![fixtures[1].0, fixtures[0].0, fixtures[2].0, fixtures[1].0],
-                RenderChunkLoadOptions {
-                    request: RenderChunkRequest::Layer { y: 64 },
+                ChunkLoadOptions {
+                    data_request: ChunkDataRequest::new().layer(64),
                     threading: WorldThreadingOptions::Fixed(4),
-                    priority: RenderChunkPriority::DistanceFrom {
+                    priority: ChunkLoadPriority::DistanceFrom {
                         chunk_x: 0,
                         chunk_z: 0,
                     },
-                    ..RenderChunkLoadOptions::default()
+                    ..ChunkLoadOptions::default()
                 },
             )
             .expect("load shuffled render chunks");
@@ -6511,7 +7129,7 @@ fn raw_height_at(
     height_map?[usize::from(local_z)][usize::from(local_x)]
 }
 
-fn raw_height_mismatch_columns(chunk: &RenderChunkData) -> usize {
+fn raw_height_mismatch_columns(chunk: &ChunkData) -> usize {
     let Some(samples) = chunk.column_samples.as_ref() else {
         return 0;
     };
@@ -6533,13 +7151,13 @@ fn raw_height_mismatch_columns(chunk: &RenderChunkData) -> usize {
     mismatches
 }
 
-fn missing_surface_columns(chunk: &RenderChunkData) -> usize {
+fn missing_surface_columns(chunk: &ChunkData) -> usize {
     chunk.column_samples.as_ref().map_or(0, |samples| {
         256usize.saturating_sub(samples.sampled_columns())
     })
 }
 
-fn needed_exact_surface_chunk_requires_full_reload(chunk: &RenderChunkData) -> Result<bool> {
+fn needed_exact_surface_chunk_requires_full_reload(chunk: &ChunkData) -> Result<bool> {
     let Some(samples) = chunk.column_samples.as_ref() else {
         return Ok(false);
     };
@@ -6741,106 +7359,4 @@ fn legacy_world_wool_name(data: u8) -> &'static str {
         15 => "minecraft:black_wool",
         _ => "minecraft:white_wool",
     }
-}
-
-fn is_air_block_name(name: &str) -> bool {
-    matches!(
-        name,
-        "air"
-            | "cave_air"
-            | "void_air"
-            | "minecraft:air"
-            | "minecraft:cave_air"
-            | "minecraft:void_air"
-            | "minecraft:structure_void"
-            | "minecraft:light_block"
-            | "minecraft:light"
-    )
-}
-
-fn is_water_block_name(name: &str) -> bool {
-    matches!(
-        name,
-        "water" | "flowing_water" | "minecraft:water" | "minecraft:flowing_water"
-    )
-}
-
-/// Terrain surface role.
-pub fn terrain_surface_role(name: &str) -> TerrainSurfaceRole {
-    if is_air_block_name(name) {
-        return TerrainSurfaceRole::Air;
-    }
-    if is_water_block_name(name) {
-        return TerrainSurfaceRole::Water;
-    }
-    if terrain_surface_overlay_alpha(name).is_some() {
-        return TerrainSurfaceRole::Overlay;
-    }
-    TerrainSurfaceRole::Primary
-}
-
-/// Terrain surface overlay alpha.
-pub fn terrain_surface_overlay_alpha(name: &str) -> Option<u8> {
-    let name = name.strip_prefix("minecraft:").unwrap_or(name);
-    if name.contains("carpet") {
-        return None;
-    }
-    if matches!(
-        name,
-        "short_grass" | "tallgrass" | "tall_grass" | "fern" | "large_fern" | "vine"
-    ) || name.contains("vine")
-    {
-        return Some(82);
-    }
-    if matches!(
-        name,
-        "deadbush"
-            | "dead_bush"
-            | "brown_mushroom"
-            | "red_mushroom"
-            | "poppy"
-            | "dandelion"
-            | "blue_orchid"
-            | "allium"
-            | "azure_bluet"
-            | "oxeye_daisy"
-            | "cornflower"
-            | "lily_of_the_valley"
-            | "wither_rose"
-            | "torchflower"
-    ) || name.contains("flower")
-        || name.contains("sapling")
-        || name.contains("bush")
-        || name.contains("petals")
-        || name.contains("tulip")
-    {
-        return Some(115);
-    }
-    if matches!(
-        name,
-        "tripWire"
-            | "trip_wire"
-            | "tripwire_hook"
-            | "redstone_wire"
-            | "rail"
-            | "detector_rail"
-            | "activator_rail"
-            | "golden_rail"
-    ) {
-        return Some(130);
-    }
-    if matches!(
-        name,
-        "torch"
-            | "redstone_torch"
-            | "unlit_redstone_torch"
-            | "soul_torch"
-            | "copper_torch"
-            | "lever"
-    ) || name.contains("button")
-        || name.contains("pressure_plate")
-    {
-        return Some(155);
-    }
-    None
 }

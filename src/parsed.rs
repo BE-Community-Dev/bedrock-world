@@ -818,35 +818,38 @@ pub fn parse_world_storage(
     storage: &dyn WorldStorage,
     options: WorldParseOptions,
 ) -> WorldResult<ParsedWorld> {
-    let actor_records = load_actor_records(storage, options)?;
+    let actor_records = options
+        .retention
+        .retains_entries()
+        .then(|| load_actor_records(storage, options))
+        .transpose()?
+        .unwrap_or_default();
 
     let mut report = WorldParseReport::default();
     let mut chunk_positions = BTreeSet::new();
     let mut parsed_entries = Vec::new();
 
-    storage.for_each_entry(StorageReadOptions::default(), &mut |raw_key, raw_value| {
-        report.entry_count += 1;
-        let key = BedrockDbKey::decode(raw_key);
-        *report.key_kinds.entry(key.summary_kind()).or_default() += 1;
-        if let BedrockDbKey::Chunk(chunk_key) = &key {
-            chunk_positions.insert(format!(
-                "{}:{}:{}",
-                chunk_key.pos.x,
-                chunk_key.pos.z,
-                chunk_key.pos.dimension.id()
-            ));
-        }
-        if options.retention.retains_entries() && should_parse_key(&key, options.categories) {
-            let value = parse_entry_value(&key, raw_value, &actor_records, &mut report, options);
-            parsed_entries.push(ParsedDbEntry {
-                key,
-                raw_key: Bytes::copy_from_slice(raw_key),
-                raw_value_len: raw_value.len(),
-                value,
-            });
-        }
-        Ok(StorageVisitorControl::Continue)
-    })?;
+    if options.retention.retains_entries() {
+        storage.for_each_entry(StorageReadOptions::default(), &mut |raw_key, raw_value| {
+            let key = record_world_key(raw_key, &mut report, &mut chunk_positions);
+            if should_parse_key(&key, options.categories) {
+                let value =
+                    parse_entry_value(&key, raw_value, &actor_records, &mut report, options);
+                parsed_entries.push(ParsedDbEntry {
+                    key,
+                    raw_key: Bytes::copy_from_slice(raw_key),
+                    raw_value_len: raw_value.len(),
+                    value,
+                });
+            }
+            Ok(StorageVisitorControl::Continue)
+        })?;
+    } else {
+        storage.for_each_key(StorageReadOptions::default(), &mut |raw_key| {
+            record_world_key(raw_key, &mut report, &mut chunk_positions);
+            Ok(StorageVisitorControl::Continue)
+        })?;
+    }
 
     report.chunk_count = chunk_positions.len();
     Ok(ParsedWorld {
@@ -854,6 +857,25 @@ pub fn parse_world_storage(
         entries: parsed_entries,
         report,
     })
+}
+
+fn record_world_key(
+    raw_key: &[u8],
+    report: &mut WorldParseReport,
+    chunk_positions: &mut BTreeSet<String>,
+) -> BedrockDbKey {
+    report.entry_count = report.entry_count.saturating_add(1);
+    let key = BedrockDbKey::decode(raw_key);
+    *report.key_kinds.entry(key.summary_kind()).or_default() += 1;
+    if let BedrockDbKey::Chunk(chunk_key) = &key {
+        chunk_positions.insert(format!(
+            "{}:{}:{}",
+            chunk_key.pos.x,
+            chunk_key.pos.z,
+            chunk_key.pos.dimension.id()
+        ));
+    }
+    key
 }
 
 #[must_use]
@@ -2085,7 +2107,55 @@ fn read_i32(value: &[u8]) -> Option<i32> {
 mod tests {
     use super::*;
     use crate::nbt::serialize_root_nbt;
-    use crate::storage::{MemoryStorage, WorldStorage};
+    use crate::storage::{
+        MemoryStorage, StorageBatch, StorageReadOptions, StorageScanOutcome, WorldStorage,
+    };
+
+    struct KeyOnlySummaryStorage {
+        key: Bytes,
+    }
+
+    impl WorldStorage for KeyOnlySummaryStorage {
+        fn get(&self, _key: &[u8]) -> WorldResult<Option<Bytes>> {
+            Ok(None)
+        }
+
+        fn put(&self, _key: &[u8], _value: &[u8]) -> WorldResult<()> {
+            Err(BedrockWorldError::ReadOnly)
+        }
+
+        fn delete(&self, _key: &[u8]) -> WorldResult<()> {
+            Err(BedrockWorldError::ReadOnly)
+        }
+
+        fn for_each_key(
+            &self,
+            _options: StorageReadOptions,
+            visitor: &mut (dyn FnMut(&[u8]) -> WorldResult<StorageVisitorControl> + Send),
+        ) -> WorldResult<StorageScanOutcome> {
+            let _ = visitor(&self.key)?;
+            Ok(StorageScanOutcome::empty())
+        }
+
+        fn for_each_prefix(
+            &self,
+            _prefix: &[u8],
+            _options: StorageReadOptions,
+            _visitor: &mut (dyn FnMut(&[u8], &Bytes) -> WorldResult<StorageVisitorControl> + Send),
+        ) -> WorldResult<StorageScanOutcome> {
+            Err(BedrockWorldError::Validation(
+                "summary parsing requested values".to_string(),
+            ))
+        }
+
+        fn write_batch(&self, _batch: &StorageBatch) -> WorldResult<()> {
+            Err(BedrockWorldError::ReadOnly)
+        }
+
+        fn flush(&self) -> WorldResult<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn item_stack_extracts_common_fields() {
@@ -2366,6 +2436,32 @@ mod tests {
         .expect("parse summary");
 
         assert_eq!(parsed.report.entry_count, 2);
+        assert_eq!(parsed.report.chunk_count, 1);
+        assert!(parsed.entries.is_empty());
+    }
+
+    #[test]
+    fn summary_parse_uses_key_scan_without_actor_resolution() {
+        let chunk_key = crate::ChunkKey::new(
+            ChunkPos {
+                x: 3,
+                z: -4,
+                dimension: crate::Dimension::Overworld,
+            },
+            ChunkRecordTag::Version,
+        );
+        let storage = KeyOnlySummaryStorage {
+            key: chunk_key.encode(),
+        };
+
+        let parsed = parse_world_storage(
+            LevelDatDocument::new(10, NbtTag::Compound(IndexMap::new())),
+            &storage,
+            WorldParseOptions::summary(),
+        )
+        .expect("parse summary");
+
+        assert_eq!(parsed.report.entry_count, 1);
         assert_eq!(parsed.report.chunk_count, 1);
         assert!(parsed.entries.is_empty());
     }

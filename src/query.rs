@@ -3,18 +3,18 @@
 use crate::error::{BedrockWorldError, Result};
 use crate::nbt::{NbtTag, serialize_root_nbt};
 use crate::parsed::{
-    ActorResolution, ParsedBlockEntity, ParsedChunkRecordValue, ParsedEntity,
-    ParsedHardcodedSpawnArea, ParsedVillageData, RetentionMode, WorldParseCategories,
-    WorldParseOptions, parse_actor_digest_ids,
+    ParsedBlockEntity, ParsedChunkRecordValue, ParsedEntity, ParsedHardcodedSpawnArea,
+    ParsedVillageData, WorldParseOptions, parse_actor_digest_ids,
 };
 use crate::world::{BedrockWorld, ChunkBounds, SurfaceColumnOptions, WorldStorageHandle};
 use crate::{
-    ActorDigestKey, BlockPos, CancelFlag, ChunkPos, ChunkRecordTag, Dimension, RenderChunkRegion,
-    SubChunkDecodeMode, SurfaceColumn,
+    ActorDigestKey, BlockPos, CancelFlag, Chunk, ChunkKey, ChunkPos, ChunkRecord, ChunkRecordTag,
+    Dimension, StorageReadOptions, SurfaceColumn, WorldChunkQueryRegion,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::path::PathBuf;
+use xxhash_rust::xxh3::Xxh3;
 
 const MT_N: usize = 624;
 const MT_M: usize = 397;
@@ -22,6 +22,60 @@ const MT_MATRIX_A: u32 = 0x9908_b0df;
 const MT_UPPER_MASK: u32 = 0x8000_0000;
 const MT_LOWER_MASK: u32 = 0x7fff_ffff;
 const WRITE_CONFIRM_TOKEN: &str = "CONFIRMED";
+
+/// Exact chunk record categories for batched queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkRecordQuery {
+    /// Include legacy inline entity records.
+    pub entities: bool,
+    /// Include block-entity records.
+    pub block_entities: bool,
+    /// Include pending tick records.
+    pub pending_ticks: bool,
+    /// Include hardcoded spawn-area records.
+    pub hardcoded_spawn_areas: bool,
+}
+
+impl ChunkRecordQuery {
+    #[must_use]
+    /// Returns the exact storage tags required by this query.
+    pub fn tags(self) -> Vec<ChunkRecordTag> {
+        [
+            (self.entities, ChunkRecordTag::Entity),
+            (self.block_entities, ChunkRecordTag::BlockEntity),
+            (self.pending_ticks, ChunkRecordTag::PendingTicks),
+            (
+                self.hardcoded_spawn_areas,
+                ChunkRecordTag::HardcodedSpawners,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, tag)| enabled.then_some(tag))
+        .collect()
+    }
+}
+
+/// Parsed records for one chunk returned by a batched record query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkRecordQueryResult {
+    /// Queried chunk position.
+    pub pos: ChunkPos,
+    /// Parsed records limited to the requested categories.
+    pub records: Vec<crate::ParsedChunkRecord>,
+}
+
+/// XXH3-128 fingerprint of the exact raw records selected for one chunk.
+///
+/// The fingerprint includes selected missing records and, when entity records
+/// are requested, the chunk actor digest plus every referenced actor record.
+/// It can therefore validate cached query summaries without decoding NBT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkRecordFingerprint {
+    /// Chunk whose selected records were hashed.
+    pub pos: ChunkPos,
+    /// XXH3-128 digest of the selected storage records.
+    pub value: u128,
+}
 
 /// Inclusive chunk bounds used by professional map queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,8 +134,8 @@ impl SlimeChunkBounds {
     }
 }
 
-impl From<RenderChunkRegion> for SlimeChunkBounds {
-    fn from(region: RenderChunkRegion) -> Self {
+impl From<WorldChunkQueryRegion> for SlimeChunkBounds {
+    fn from(region: WorldChunkQueryRegion) -> Self {
         Self {
             dimension: region.dimension,
             min_chunk_x: region.min_chunk_x,
@@ -202,6 +256,15 @@ pub struct BlockEntityOverlay {
     pub nbt: NbtTag,
 }
 
+/// Pending tick marker shown by map overlays.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingTickOverlay {
+    /// Chunk containing the pending tick record.
+    pub chunk: ChunkPos,
+    /// Original parsed Bedrock NBT payload.
+    pub tick: NbtTag,
+}
+
 /// Hardcoded spawn area overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardcodedSpawnAreaOverlay {
@@ -278,6 +341,8 @@ pub struct RegionOverlayQuery {
     pub entities: Vec<EntityOverlay>,
     /// Whether block-entity records are loaded with render data.
     pub block_entities: Vec<BlockEntityOverlay>,
+    /// Pending tick records in the queried region.
+    pub pending_ticks: Vec<PendingTickOverlay>,
     /// Whether village records are included.
     pub villages: Vec<VillageOverlay>,
     /// Number of chunks scanned for this query.
@@ -297,6 +362,8 @@ pub struct RegionOverlayQueryOptions {
     pub include_entities: bool,
     /// Whether block-entity overlays are included.
     pub include_block_entities: bool,
+    /// Whether pending tick overlays are included.
+    pub include_pending_ticks: bool,
     /// Whether village overlays are included.
     pub include_villages: bool,
     /// Maximum chunks accepted for this query.
@@ -312,6 +379,7 @@ impl Default for RegionOverlayQueryOptions {
             include_hardcoded_spawn_areas: true,
             include_entities: true,
             include_block_entities: true,
+            include_pending_ticks: true,
             include_villages: true,
             max_chunks: 65_536,
             max_items_per_kind: 10_000,
@@ -336,6 +404,8 @@ pub struct SelectionStats {
     pub entity_count: usize,
     /// Number of block entity overlays found in the selection.
     pub block_entity_count: usize,
+    /// Number of pending tick overlays found in the selection.
+    pub pending_tick_count: usize,
     /// Number of hardcoded spawn area overlays found in the selection.
     pub hardcoded_spawn_area_count: usize,
     /// Number of village overlays found in the selection.
@@ -519,6 +589,355 @@ where
     Ok(ChunkDetail { pos, records })
 }
 
+/// Reads selected record kinds for many chunks with exact-key batches.
+pub fn query_chunk_records_many_blocking<S>(
+    world: &BedrockWorld<S>,
+    positions: impl IntoIterator<Item = ChunkPos>,
+    query: ChunkRecordQuery,
+) -> Result<Vec<ChunkRecordQueryResult>>
+where
+    S: WorldStorageHandle,
+{
+    query_chunk_records_many_blocking_inner(world, positions, query, None, None)
+}
+
+/// Reads selected record kinds for many chunks with cancellation support.
+pub fn query_chunk_records_many_blocking_with_control<S>(
+    world: &BedrockWorld<S>,
+    positions: impl IntoIterator<Item = ChunkPos>,
+    query: ChunkRecordQuery,
+    cancel: &CancelFlag,
+) -> Result<Vec<ChunkRecordQueryResult>>
+where
+    S: WorldStorageHandle,
+{
+    query_chunk_records_many_blocking_inner(world, positions, query, Some(cancel), None)
+}
+
+/// Hashes selected chunk record kinds without decoding their NBT payloads.
+///
+/// This follows the same exact-key and actor-digest resolution path as
+/// [`query_chunk_records_many_blocking`], but only returns a compact
+/// XXH3-128 fingerprint per input chunk.
+pub fn fingerprint_chunk_records_many_blocking<S>(
+    world: &BedrockWorld<S>,
+    positions: impl IntoIterator<Item = ChunkPos>,
+    query: ChunkRecordQuery,
+) -> Result<Vec<ChunkRecordFingerprint>>
+where
+    S: WorldStorageHandle,
+{
+    fingerprint_chunk_records_many_blocking_inner(world, positions, query, None)
+}
+
+/// Hashes selected chunk record kinds with cancellation support.
+pub fn fingerprint_chunk_records_many_blocking_with_control<S>(
+    world: &BedrockWorld<S>,
+    positions: impl IntoIterator<Item = ChunkPos>,
+    query: ChunkRecordQuery,
+    cancel: &CancelFlag,
+) -> Result<Vec<ChunkRecordFingerprint>>
+where
+    S: WorldStorageHandle,
+{
+    fingerprint_chunk_records_many_blocking_inner(world, positions, query, Some(cancel))
+}
+
+fn fingerprint_chunk_records_many_blocking_inner<S>(
+    world: &BedrockWorld<S>,
+    positions: impl IntoIterator<Item = ChunkPos>,
+    query: ChunkRecordQuery,
+    cancel: Option<&CancelFlag>,
+) -> Result<Vec<ChunkRecordFingerprint>>
+where
+    S: WorldStorageHandle,
+{
+    check_query_cancelled(cancel)?;
+    let positions = positions.into_iter().collect::<Vec<_>>();
+    let tags = query.tags();
+    if positions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hashers = positions
+        .iter()
+        .map(|pos| {
+            let mut hasher = Xxh3::new();
+            hasher.update(&pos.x.to_le_bytes());
+            hasher.update(&pos.z.to_le_bytes());
+            hasher.update(&pos.dimension.id().to_le_bytes());
+            hasher
+        })
+        .collect::<Vec<_>>();
+    if tags.is_empty() {
+        return Ok(positions
+            .into_iter()
+            .zip(hashers)
+            .map(|(pos, hasher)| ChunkRecordFingerprint {
+                pos,
+                value: hasher.digest128(),
+            })
+            .collect());
+    }
+    let mut keys = Vec::with_capacity(
+        positions
+            .len()
+            .saturating_mul(tags.len().saturating_add(usize::from(query.entities))),
+    );
+    let mut owners = Vec::with_capacity(keys.capacity());
+    for (chunk_index, pos) in positions.iter().copied().enumerate() {
+        for tag in &tags {
+            keys.push(ChunkKey::new(pos, *tag).encode());
+            owners.push(BatchedRecordOwner::ChunkRecord {
+                chunk_index,
+                tag: *tag,
+            });
+        }
+        if query.entities {
+            keys.push(ActorDigestKey::new(pos).storage_key());
+            owners.push(BatchedRecordOwner::ActorDigest { chunk_index });
+        }
+    }
+    let values = world
+        .storage()
+        .get_many_ordered_with_control(&keys, record_query_read_options(cancel))?;
+    let mut actor_ids_by_chunk = vec![Vec::new(); positions.len()];
+    for ((owner, key), value) in owners.into_iter().zip(keys).zip(values) {
+        match owner {
+            BatchedRecordOwner::ChunkRecord { chunk_index, tag } => {
+                hashers
+                    .get_mut(chunk_index)
+                    .map(|hasher| hash_record(hasher, &key, value.as_deref(), Some(tag)));
+            }
+            BatchedRecordOwner::ActorDigest { chunk_index } => {
+                hashers
+                    .get_mut(chunk_index)
+                    .map(|hasher| hash_record(hasher, &key, value.as_deref(), None));
+                if let Some(value) = value {
+                    if let Some(actor_ids) = actor_ids_by_chunk.get_mut(chunk_index) {
+                        actor_ids.extend(parse_actor_digest_ids(&value)?);
+                    }
+                }
+            }
+        }
+    }
+    let mut actor_ids = actor_ids_by_chunk
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    actor_ids.sort_unstable();
+    actor_ids.dedup();
+    if !actor_ids.is_empty() {
+        check_query_cancelled(cancel)?;
+        let actor_keys = actor_ids
+            .iter()
+            .map(|actor_id| actor_id.storage_key())
+            .collect::<Vec<_>>();
+        let actor_values = world
+            .storage()
+            .get_many_ordered_with_control(&actor_keys, record_query_read_options(cancel))?;
+        for (hasher, chunk_actor_ids) in hashers.iter_mut().zip(actor_ids_by_chunk) {
+            for actor_id in chunk_actor_ids {
+                check_query_cancelled(cancel)?;
+                let actor_index = actor_ids.binary_search(&actor_id).map_err(|_| {
+                    BedrockWorldError::Validation("actor digest id was not indexed".to_string())
+                })?;
+                let actor_key = actor_keys.get(actor_index).ok_or_else(|| {
+                    BedrockWorldError::Validation("actor key index was missing".to_string())
+                })?;
+                let actor_value = actor_values.get(actor_index).and_then(Option::as_deref);
+                hash_record(hasher, actor_key, actor_value, None);
+            }
+        }
+    }
+    Ok(positions
+        .into_iter()
+        .zip(hashers)
+        .map(|(pos, hasher)| ChunkRecordFingerprint {
+            pos,
+            value: hasher.digest128(),
+        })
+        .collect())
+}
+
+fn hash_record(hasher: &mut Xxh3, key: &[u8], value: Option<&[u8]>, tag: Option<ChunkRecordTag>) {
+    hasher.update(&[tag.map_or(0xff, ChunkRecordTag::byte)]);
+    hasher.update(&(key.len() as u32).to_le_bytes());
+    hasher.update(key);
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+        None => hasher.update(&[0]),
+    }
+}
+
+fn query_chunk_records_many_blocking_inner<S>(
+    world: &BedrockWorld<S>,
+    positions: impl IntoIterator<Item = ChunkPos>,
+    query: ChunkRecordQuery,
+    cancel: Option<&CancelFlag>,
+    max_actor_records: Option<usize>,
+) -> Result<Vec<ChunkRecordQueryResult>>
+where
+    S: WorldStorageHandle,
+{
+    check_query_cancelled(cancel)?;
+    let positions = positions.into_iter().collect::<Vec<_>>();
+    let tags = query.tags();
+    if positions.is_empty() || tags.is_empty() {
+        return Ok(positions
+            .into_iter()
+            .map(|pos| ChunkRecordQueryResult {
+                pos,
+                records: Vec::new(),
+            })
+            .collect());
+    }
+    let mut keys = Vec::with_capacity(
+        positions
+            .len()
+            .saturating_mul(tags.len().saturating_add(usize::from(query.entities))),
+    );
+    let mut owners = Vec::with_capacity(keys.capacity());
+    for (chunk_index, pos) in positions.iter().copied().enumerate() {
+        for tag in &tags {
+            keys.push(ChunkKey::new(pos, *tag).encode());
+            owners.push(BatchedRecordOwner::ChunkRecord {
+                chunk_index,
+                tag: *tag,
+            });
+        }
+        if query.entities {
+            keys.push(ActorDigestKey::new(pos).storage_key());
+            owners.push(BatchedRecordOwner::ActorDigest { chunk_index });
+        }
+    }
+    let values = world
+        .storage()
+        .get_many_ordered_with_control(&keys, record_query_read_options(cancel))?;
+    let mut chunks = positions
+        .iter()
+        .copied()
+        .map(|pos| Chunk {
+            pos,
+            version: None,
+            records: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut actor_ids_by_chunk = vec![Vec::new(); chunks.len()];
+    for (owner, value) in owners.into_iter().zip(values) {
+        let Some(value) = value else {
+            continue;
+        };
+        match owner {
+            BatchedRecordOwner::ChunkRecord { chunk_index, tag } => {
+                if let Some(chunk) = chunks.get_mut(chunk_index) {
+                    chunk.records.push(ChunkRecord {
+                        key: ChunkKey::new(chunk.pos, tag),
+                        value,
+                    });
+                }
+            }
+            BatchedRecordOwner::ActorDigest { chunk_index } => {
+                if let Some(actor_ids) = actor_ids_by_chunk.get_mut(chunk_index) {
+                    actor_ids.extend(parse_actor_digest_ids(&value)?);
+                }
+            }
+        }
+    }
+    append_referenced_actor_records(
+        world,
+        &mut chunks,
+        &actor_ids_by_chunk,
+        cancel,
+        max_actor_records,
+    )?;
+    Ok(chunks
+        .into_iter()
+        .map(|chunk| {
+            let parsed = crate::parsed::parse_chunk_records_with_options(
+                chunk.pos,
+                chunk.records,
+                WorldParseOptions::structured(),
+            );
+            ChunkRecordQueryResult {
+                pos: parsed.pos,
+                records: parsed.records,
+            }
+        })
+        .collect())
+}
+
+#[derive(Clone, Copy)]
+enum BatchedRecordOwner {
+    ChunkRecord {
+        chunk_index: usize,
+        tag: ChunkRecordTag,
+    },
+    ActorDigest {
+        chunk_index: usize,
+    },
+}
+
+fn record_query_read_options(cancel: Option<&CancelFlag>) -> StorageReadOptions {
+    StorageReadOptions {
+        cache_policy: crate::StorageCachePolicy::Use,
+        cancel: cancel.map(CancelFlag::to_storage_cancel),
+        ..StorageReadOptions::default()
+    }
+}
+
+fn append_referenced_actor_records<S>(
+    world: &BedrockWorld<S>,
+    chunks: &mut [Chunk],
+    actor_ids_by_chunk: &[Vec<crate::ActorUid>],
+    cancel: Option<&CancelFlag>,
+    max_actor_records: Option<usize>,
+) -> Result<()>
+where
+    S: WorldStorageHandle,
+{
+    let mut unique_actor_ids = actor_ids_by_chunk
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    unique_actor_ids.sort_unstable();
+    unique_actor_ids.dedup();
+    if let Some(max_actor_records) = max_actor_records {
+        unique_actor_ids.truncate(max_actor_records);
+    }
+    if unique_actor_ids.is_empty() {
+        return Ok(());
+    }
+    check_query_cancelled(cancel)?;
+    let actor_keys = unique_actor_ids
+        .iter()
+        .map(|actor_id| actor_id.storage_key())
+        .collect::<Vec<_>>();
+    let actor_values = world
+        .storage()
+        .get_many_ordered_with_control(&actor_keys, record_query_read_options(cancel))?;
+    for (chunk, chunk_actor_ids) in chunks.iter_mut().zip(actor_ids_by_chunk) {
+        for actor_id in chunk_actor_ids {
+            let Ok(actor_index) = unique_actor_ids.binary_search(actor_id) else {
+                continue;
+            };
+            let Some(Some(value)) = actor_values.get(actor_index) else {
+                continue;
+            };
+            chunk.records.push(ChunkRecord {
+                key: ChunkKey::new(chunk.pos, ChunkRecordTag::Entity),
+                value: value.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Query region overlays blocking.
 pub fn query_region_overlays_blocking<S>(
     world: &BedrockWorld<S>,
@@ -567,12 +986,13 @@ where
         hardcoded_spawn_areas: Vec::new(),
         entities: Vec::new(),
         block_entities: Vec::new(),
+        pending_ticks: Vec::new(),
         villages: Vec::new(),
         scanned_chunks: 0,
         missing_chunks: 0,
     };
-    let chunk_parse_options = overlay_chunk_parse_options(options);
     let needs_chunk_records = overlay_options_need_chunk_records(options);
+    let mut positions = Vec::with_capacity(bounds.chunk_count());
     for chunk_z in bounds.min_chunk_z..=bounds.max_chunk_z {
         check_query_cancelled(cancel)?;
         for chunk_x in bounds.min_chunk_x..=bounds.max_chunk_x {
@@ -585,50 +1005,27 @@ where
             if options.include_slime && is_slime_chunk(pos) {
                 result.slime_chunks.push(pos);
             }
-            if !needs_chunk_records {
-                continue;
+            if needs_chunk_records {
+                positions.push(pos);
             }
-            let parsed = world.parse_chunk_with_options_blocking(pos, chunk_parse_options)?;
+        }
+    }
+    if needs_chunk_records {
+        let records = query_chunk_records_many_blocking_inner(
+            world,
+            positions,
+            overlay_record_query(options),
+            cancel,
+            Some(options.max_items_per_kind),
+        )?;
+        for parsed in records {
+            check_query_cancelled(cancel)?;
             if parsed.records.is_empty() {
                 result.missing_chunks = result.missing_chunks.saturating_add(1);
                 continue;
             }
             result.scanned_chunks = result.scanned_chunks.saturating_add(1);
-            for record in parsed.records {
-                match record.value {
-                    ParsedChunkRecordValue::HardcodedSpawnAreas(areas)
-                        if options.include_hardcoded_spawn_areas =>
-                    {
-                        for area in areas {
-                            if result.hardcoded_spawn_areas.len() >= options.max_items_per_kind {
-                                break;
-                            }
-                            result
-                                .hardcoded_spawn_areas
-                                .push(HardcodedSpawnAreaOverlay { area, chunk: pos });
-                        }
-                    }
-                    ParsedChunkRecordValue::Entities(entities) if options.include_entities => {
-                        push_entities(
-                            &mut result.entities,
-                            entities,
-                            pos,
-                            options.max_items_per_kind,
-                        );
-                    }
-                    ParsedChunkRecordValue::BlockEntities(block_entities)
-                        if options.include_block_entities =>
-                    {
-                        push_block_entities(
-                            &mut result.block_entities,
-                            block_entities,
-                            pos,
-                            options.max_items_per_kind,
-                        );
-                    }
-                    _ => {}
-                }
-            }
+            append_overlay_records(&mut result, parsed.pos, parsed.records, options);
         }
     }
     if options.include_villages {
@@ -644,25 +1041,68 @@ fn overlay_options_need_chunk_records(options: RegionOverlayQueryOptions) -> boo
     options.include_hardcoded_spawn_areas
         || options.include_entities
         || options.include_block_entities
+        || options.include_pending_ticks
 }
 
-fn overlay_chunk_parse_options(options: RegionOverlayQueryOptions) -> WorldParseOptions {
-    WorldParseOptions {
-        categories: WorldParseCategories {
-            chunks: true,
-            players: false,
-            actors: options.include_entities,
-            maps: false,
-            villages: false,
-            globals: false,
-        },
-        retention: RetentionMode::Structured,
-        subchunk_decode_mode: SubChunkDecodeMode::CountsOnly,
-        actor_resolution: if options.include_entities {
-            ActorResolution::ResolveReferenced
-        } else {
-            ActorResolution::None
-        },
+fn overlay_record_query(options: RegionOverlayQueryOptions) -> ChunkRecordQuery {
+    ChunkRecordQuery {
+        entities: options.include_entities,
+        block_entities: options.include_block_entities,
+        pending_ticks: options.include_pending_ticks,
+        hardcoded_spawn_areas: options.include_hardcoded_spawn_areas,
+    }
+}
+
+fn append_overlay_records(
+    result: &mut RegionOverlayQuery,
+    pos: ChunkPos,
+    records: Vec<crate::ParsedChunkRecord>,
+    options: RegionOverlayQueryOptions,
+) {
+    for record in records {
+        match record.value {
+            ParsedChunkRecordValue::HardcodedSpawnAreas(areas)
+                if options.include_hardcoded_spawn_areas =>
+            {
+                for area in areas {
+                    if result.hardcoded_spawn_areas.len() >= options.max_items_per_kind {
+                        break;
+                    }
+                    result
+                        .hardcoded_spawn_areas
+                        .push(HardcodedSpawnAreaOverlay { area, chunk: pos });
+                }
+            }
+            ParsedChunkRecordValue::Entities(entities) if options.include_entities => {
+                push_entities(
+                    &mut result.entities,
+                    entities,
+                    pos,
+                    options.max_items_per_kind,
+                );
+            }
+            ParsedChunkRecordValue::BlockEntities(block_entities)
+                if options.include_block_entities =>
+            {
+                push_block_entities(
+                    &mut result.block_entities,
+                    block_entities,
+                    pos,
+                    options.max_items_per_kind,
+                );
+            }
+            ParsedChunkRecordValue::PendingTicks(ticks) if options.include_pending_ticks => {
+                for tick in ticks {
+                    if result.pending_ticks.len() >= options.max_items_per_kind {
+                        break;
+                    }
+                    result
+                        .pending_ticks
+                        .push(PendingTickOverlay { chunk: pos, tick });
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -693,6 +1133,7 @@ where
         slime_chunks: overlays.slime_chunks.len(),
         entity_count: overlays.entities.len(),
         block_entity_count: overlays.block_entities.len(),
+        pending_tick_count: overlays.pending_ticks.len(),
         hardcoded_spawn_area_count: overlays.hardcoded_spawn_areas.len(),
         village_count: overlays.villages.len(),
     })
@@ -1047,6 +1488,201 @@ mod tests {
         .expect_err("cancelled query should fail");
 
         assert_eq!(error.kind(), crate::BedrockWorldErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn chunk_record_query_reads_modern_actors_and_pending_ticks_in_order() {
+        let storage = Arc::new(MemoryStorage::new());
+        let world = BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions {
+                read_only: false,
+                ..OpenOptions::default()
+            },
+        );
+        let first = ChunkPos {
+            x: 2,
+            z: 3,
+            dimension: Dimension::Overworld,
+        };
+        let second = ChunkPos {
+            x: 4,
+            z: 5,
+            dimension: Dimension::Overworld,
+        };
+        let actor = ParsedEntity {
+            identifier: Some("minecraft:pig".to_string()),
+            definitions: Vec::new(),
+            unique_id: Some(77),
+            position: Some([32.0, 64.0, 48.0]),
+            rotation: None,
+            motion: None,
+            items: Vec::new(),
+            nbt: NbtTag::Compound(IndexMap::from([
+                (
+                    "identifier".to_string(),
+                    NbtTag::String("minecraft:pig".to_string()),
+                ),
+                ("UniqueID".to_string(), NbtTag::Long(77)),
+                (
+                    "Pos".to_string(),
+                    NbtTag::List(vec![
+                        NbtTag::Float(32.0),
+                        NbtTag::Float(64.0),
+                        NbtTag::Float(48.0),
+                    ]),
+                ),
+            ])),
+        };
+        world
+            .put_actor_blocking(first, &actor)
+            .expect("write actor");
+        let pending_tick = NbtTag::Compound(IndexMap::from([("x".to_string(), NbtTag::Int(65))]));
+        world
+            .put_raw_record_blocking(
+                &ChunkKey::new(second, ChunkRecordTag::PendingTicks),
+                &serialize_root_nbt(&pending_tick).expect("serialize pending tick"),
+            )
+            .expect("write pending tick");
+
+        let results = query_chunk_records_many_blocking(
+            &world,
+            [second, first],
+            ChunkRecordQuery {
+                entities: true,
+                block_entities: false,
+                pending_ticks: true,
+                hardcoded_spawn_areas: false,
+            },
+        )
+        .expect("query records");
+
+        assert_eq!(
+            results.iter().map(|result| result.pos).collect::<Vec<_>>(),
+            [second, first]
+        );
+        assert!(matches!(
+            results[0].records.first().map(|record| &record.value),
+            Some(ParsedChunkRecordValue::PendingTicks(ticks)) if ticks.len() == 1
+        ));
+        assert!(matches!(
+            results[1].records.first().map(|record| &record.value),
+            Some(ParsedChunkRecordValue::Entities(entities)) if entities.len() == 1
+        ));
+    }
+
+    #[test]
+    fn region_overlay_query_includes_batched_modern_actors_and_pending_ticks() {
+        let storage = Arc::new(MemoryStorage::new());
+        let world = BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions {
+                read_only: false,
+                ..OpenOptions::default()
+            },
+        );
+        let pos = ChunkPos {
+            x: 2,
+            z: 3,
+            dimension: Dimension::Overworld,
+        };
+        let actor = ParsedEntity {
+            identifier: Some("minecraft:pig".to_string()),
+            definitions: Vec::new(),
+            unique_id: Some(77),
+            position: Some([32.0, 64.0, 48.0]),
+            rotation: None,
+            motion: None,
+            items: Vec::new(),
+            nbt: NbtTag::Compound(IndexMap::from([
+                (
+                    "identifier".to_string(),
+                    NbtTag::String("minecraft:pig".to_string()),
+                ),
+                ("UniqueID".to_string(), NbtTag::Long(77)),
+                (
+                    "Pos".to_string(),
+                    NbtTag::List(vec![
+                        NbtTag::Float(32.0),
+                        NbtTag::Float(64.0),
+                        NbtTag::Float(48.0),
+                    ]),
+                ),
+            ])),
+        };
+        world.put_actor_blocking(pos, &actor).expect("write actor");
+        let pending_tick = NbtTag::Compound(IndexMap::from([("x".to_string(), NbtTag::Int(33))]));
+        world
+            .put_raw_record_blocking(
+                &ChunkKey::new(pos, ChunkRecordTag::PendingTicks),
+                &serialize_root_nbt(&pending_tick).expect("serialize pending tick"),
+            )
+            .expect("write pending tick");
+
+        let overlays = query_region_overlays_blocking(
+            &world,
+            SlimeChunkBounds {
+                dimension: Dimension::Overworld,
+                min_chunk_x: pos.x,
+                max_chunk_x: pos.x,
+                min_chunk_z: pos.z,
+                max_chunk_z: pos.z,
+            },
+            RegionOverlayQueryOptions {
+                include_slime: false,
+                include_hardcoded_spawn_areas: false,
+                include_entities: true,
+                include_block_entities: false,
+                include_pending_ticks: true,
+                include_villages: false,
+                max_chunks: 1,
+                max_items_per_kind: 10,
+            },
+        )
+        .expect("query overlays");
+
+        assert_eq!(overlays.entities.len(), 1);
+        assert_eq!(overlays.pending_ticks.len(), 1);
+        assert_eq!(overlays.pending_ticks[0].chunk, pos);
+    }
+
+    #[test]
+    fn chunk_record_fingerprint_changes_when_selected_raw_record_changes() {
+        let storage = Arc::new(MemoryStorage::new());
+        let world = BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions {
+                read_only: false,
+                ..OpenOptions::default()
+            },
+        );
+        let pos = ChunkPos {
+            x: -2,
+            z: 7,
+            dimension: Dimension::Overworld,
+        };
+        let key = ChunkKey::new(pos, ChunkRecordTag::BlockEntity);
+        world
+            .put_raw_record_blocking(&key, b"first")
+            .expect("write first value");
+        let query = ChunkRecordQuery {
+            entities: false,
+            block_entities: true,
+            pending_ticks: false,
+            hardcoded_spawn_areas: false,
+        };
+        let first = fingerprint_chunk_records_many_blocking(&world, [pos], query)
+            .expect("fingerprint first value");
+        world
+            .put_raw_record_blocking(&key, b"second")
+            .expect("write second value");
+        let second = fingerprint_chunk_records_many_blocking(&world, [pos], query)
+            .expect("fingerprint second value");
+
+        assert_ne!(first[0].value, second[0].value);
     }
 
     #[test]

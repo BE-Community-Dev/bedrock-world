@@ -151,7 +151,7 @@ impl<'a> NbtReader<'a> {
 
     /// Parses one root tag and exposes it through a borrowed-style view.
     pub fn parse_root_ref(&self) -> Result<NbtRef<'a>> {
-        self.parse_root().map(NbtRef::from_owned)
+        crate::nbt_ref::parse_root(self.data)
     }
 
     /// Returns a borrowed view over the same raw payload.
@@ -283,32 +283,6 @@ pub enum NbtEvent<'a> {
         /// Number of 16-bit integers declared by the array header.
         len: usize,
     },
-}
-
-impl NbtRef<'_> {
-    fn from_owned(tag: NbtTag) -> Self {
-        match tag {
-            NbtTag::End => Self::End,
-            NbtTag::Byte(value) => Self::Byte(value),
-            NbtTag::Short(value) => Self::Short(value),
-            NbtTag::Int(value) => Self::Int(value),
-            NbtTag::Long(value) => Self::Long(value),
-            NbtTag::Float(value) => Self::Float(value),
-            NbtTag::Double(value) => Self::Double(value),
-            NbtTag::ByteArray(values) => Self::ByteArray(Cow::Owned(values)),
-            NbtTag::String(value) => Self::String(Cow::Owned(value)),
-            NbtTag::List(values) => Self::List(values.into_iter().map(Self::from_owned).collect()),
-            NbtTag::Compound(values) => Self::Compound(
-                values
-                    .into_iter()
-                    .map(|(key, value)| (Cow::Owned(key), Self::from_owned(value)))
-                    .collect(),
-            ),
-            NbtTag::IntArray(values) => Self::IntArray(Cow::Owned(values)),
-            NbtTag::LongArray(values) => Self::LongArray(Cow::Owned(values)),
-            NbtTag::ShortArray(values) => Self::ShortArray(Cow::Owned(values)),
-        }
-    }
 }
 
 /// Writer for Bedrock little-endian NBT roots.
@@ -1067,6 +1041,65 @@ mod tests {
                 bytes
             } if *bytes == [1, 2, 3]
         )));
+    }
+
+    #[test]
+    fn root_ref_parser_borrows_string_values() {
+        let bytes = serialize_root_nbt(&NbtTag::Compound(IndexMap::from([(
+            "Name".to_string(),
+            NbtTag::String("Borrowed".to_string()),
+        )])))
+        .expect("serialize");
+
+        let parsed = NbtReader::new(&bytes).parse_root_ref().expect("parse ref");
+        let NbtRef::Compound(entries) = parsed else {
+            panic!("expected compound");
+        };
+
+        assert!(matches!(
+            entries.first(),
+            Some((
+                Cow::Borrowed("Name"),
+                NbtRef::String(Cow::Borrowed("Borrowed"))
+            ))
+        ));
+    }
+
+    #[test]
+    fn root_ref_parser_matches_owned_parser_for_all_tag_kinds() {
+        let tag = NbtTag::Compound(IndexMap::from([
+            ("Byte".to_string(), NbtTag::Byte(-1)),
+            ("Short".to_string(), NbtTag::Short(-2)),
+            ("Int".to_string(), NbtTag::Int(-3)),
+            ("Long".to_string(), NbtTag::Long(-4)),
+            ("Float".to_string(), NbtTag::Float(1.5)),
+            ("Double".to_string(), NbtTag::Double(2.5)),
+            ("Bytes".to_string(), NbtTag::ByteArray(vec![-1, 0, 1])),
+            ("String".to_string(), NbtTag::String("value".to_string())),
+            (
+                "List".to_string(),
+                NbtTag::List(vec![NbtTag::Int(1), NbtTag::Int(2)]),
+            ),
+            (
+                "Compound".to_string(),
+                NbtTag::Compound(IndexMap::from([(
+                    "Nested".to_string(),
+                    NbtTag::String("value".to_string()),
+                )])),
+            ),
+            ("Ints".to_string(), NbtTag::IntArray(vec![-1, 0, 1])),
+            ("Longs".to_string(), NbtTag::LongArray(vec![-1, 0, 1])),
+            ("Shorts".to_string(), NbtTag::ShortArray(vec![-1, 0, 1])),
+        ]));
+        let bytes = serialize_root_nbt(&tag).expect("serialize");
+
+        let owned = NbtReader::new(&bytes).parse_root().expect("parse owned");
+        let borrowed = NbtReader::new(&bytes)
+            .parse_root_ref()
+            .expect("parse borrowed")
+            .to_owned_tag();
+
+        assert!(nbt_tags_equal_for_write(&owned, &borrowed));
     }
 
     #[test]

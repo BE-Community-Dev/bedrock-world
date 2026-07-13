@@ -62,11 +62,11 @@ Interactive renderers should not wait for `list_chunk_positions_blocking` before
 painting the first viewport. Use the render-index APIs instead:
 
 - `list_render_chunk_positions_blocking` lists chunks that have render records.
-- `list_render_chunk_positions_in_region_blocking` probes only a viewport or
+- `list_chunk_positions_in_region_blocking` probes only a viewport or
   export region using key-only prefix scans.
-- `load_render_chunk_blocking`, `load_render_chunks_blocking`, and
-  `load_render_region_blocking` accept `RenderChunkLoadOptions` /
-  `RenderRegionLoadOptions` with `threading`, `pipeline`, `cancel`,
+- `query_chunk_data_blocking`, `query_chunk_data_many_blocking`, and
+  `query_chunk_region_blocking` accept `ChunkLoadOptions` /
+  `WorldChunkQueryRegionLoadOptions` with `threading`, `pipeline`, `cancel`,
   `progress`, and `priority` policies.
 
 Async wrappers with the same names are available behind the default `async`
@@ -75,7 +75,7 @@ The blocking implementation uses bounded local parallelism, not Rayon global
 pool state.
 
 ```rust
-let region = bedrock_world::RenderChunkRegion {
+let region = bedrock_world::WorldChunkQueryRegion {
     dimension,
     min_chunk_x: -32,
     min_chunk_z: -32,
@@ -94,8 +94,8 @@ let positions = world.list_render_chunk_positions_in_region(
 ).await?;
 let chunks = world.load_render_chunks(
     positions,
-    bedrock_world::RenderChunkLoadOptions {
-        priority: bedrock_world::RenderChunkPriority::DistanceFrom {
+    bedrock_world::ChunkLoadOptions {
+        priority: bedrock_world::ChunkLoadPriority::DistanceFrom {
             chunk_x: 0,
             chunk_z: 0,
         },
@@ -104,26 +104,33 @@ let chunks = world.load_render_chunks(
 ).await?;
 ```
 
-`load_render_region_blocking` returns `RenderRegionData { region, chunks, stats }`.
+`query_chunk_region_blocking` returns `WorldChunkQueryRegionData { region, chunks, stats }`.
 Use `stats.worker_threads`, `stats.queue_wait_ms`, and
 `stats.subchunks_decoded` to tune worker budgets without baking fixed time
 thresholds into tests.
 
-`RenderChunkLoadOptions::request` selects one terrain contract, preventing
-callers from mixing incompatible surface, raw-height, layer, and biome flags:
+`ChunkLoadOptions::data_request` accepts a composable `ChunkDataRequest`.
+Add only the payload that a consumer needs: `surface_columns(policy)`,
+`layer(y)`, `cave_slice(y)`, `full_3d_indices()`, `height_map()`,
+`biome(requirement)`, and `block_entities()`. The loader unions subchunk keys
+for all requested representations, uses packed palette indices for a
+surface-only request, and upgrades to full 3D indices only when a layer, cave,
+or full-3D requirement needs random access. `ChunkDataRequest` remains a
+legacy mutually-exclusive compatibility contract.
 
-- `RenderChunkRequest::ExactSurface` loads block data and computes
-  `RenderChunkData::column_samples` by scanning each X/Z column top-down.
-  Surface block/height, relief support block/height, thin overlay, water
-  context, biome, and source are derived from actual blocks, not raw heightmap
-  records.
-- `RenderChunkRequest::RawHeightMap` keeps the raw Data2D/Data3D or
-  LegacyTerrain heightmap path for diagnostics and does not build surface
-  samples.
-- `RenderChunkRequest::Layer { y }` and `RenderChunkRequest::Biome { y, .. }`
-  load only the data needed for fixed layer/cave or biome reads.
+```rust
+let request = bedrock_world::ChunkDataRequest::new()
+    .surface_columns(bedrock_world::ExactSurfaceSubchunkPolicy::HintThenVerify)
+    .height_map()
+    .biome(bedrock_world::BiomeDataRequirement::SurfaceColumns);
+let options = bedrock_world::ChunkLoadOptions::for_data_request(request);
+```
 
-Raw heightmaps remain available through `RenderChunkData::height_map`, but map
+Surface samples in `ChunkData::column_samples` are derived from actual
+blocks, including relief support, thin overlays, water context, biome, and
+source, rather than raw heightmap records.
+
+Raw heightmaps remain available through `ChunkData::height_map`, but map
 renderers should treat them as hints or diagnostics. Stats expose
 `computed_surface_columns`, `raw_height_mismatch_columns`,
 `missing_subchunk_columns`, `legacy_fallback_columns`,
@@ -131,10 +138,10 @@ renderers should treat them as hints or diagnostics. Stats expose
 
 For old LevelDB worlds, render exact-batch loading always requests
 `ChunkRecordTag::LegacyTerrain` (`0x30`). If that record exists,
-`RenderChunkData::legacy_terrain` is populated, the chunk is considered loaded
-even without `Data2D`/`SubChunkPrefix`, and `RenderLoadStats::prefix_scans`
+`ChunkData::legacy_terrain` is populated, the chunk is considered loaded
+even without `Data2D`/`SubChunkPrefix`, and `ChunkLoadStats::prefix_scans`
 remains `0`.
-Legacy biome samples are exposed through `RenderChunkData::legacy_biomes` as
+Legacy biome samples are exposed through `ChunkData::legacy_biomes` as
 `[biome_id, red, green, blue]`; `legacy_biome_colors` is retained only as a
 compatibility `0x00RRGGBB` view. When both `LegacyTerrain` biome samples and
 old Data2D/Data3D biome ids exist, exact surface sampling prefers the saved
@@ -143,7 +150,7 @@ legacy RGB sample and treats the numeric biome id as fallback only.
 Exact render chunk batches preserve the input key/value association after
 deduplication, priority sorting, and parallel decode. Regression fixtures should
 shuffle and duplicate `ChunkPos` values, then assert each returned
-`RenderChunkData.pos` still carries the matching block, height, and biome
+`ChunkData.pos` still carries the matching block, height, and biome
 sentinels.
 
 `PocketChunksDatStorage` is a read-only `WorldStorage` backend. It maps each

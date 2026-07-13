@@ -33,15 +33,15 @@ but the world itself must stay outside the repository.
 
 Render exact-batch tests should include shuffled, duplicated, and
 priority-sorted `ChunkPos` inputs. Use asymmetric block/height/biome sentinel
-values and assert that every returned `RenderChunkData.pos` still owns the
-matching decoded records with `RenderLoadStats::prefix_scans == 0`.
+values and assert that every returned `ChunkData.pos` still owns the
+matching decoded records with `ChunkLoadStats::prefix_scans == 0`.
 
-Surface correctness tests should prefer `RenderChunkRequest::ExactSurface`.
+Surface correctness tests should prefer `ChunkDataRequest::new().surface_columns(ExactSurfaceSubchunkPolicy::Full)`.
 Create fixtures where raw Data2D/Data3D or legacy heightmap values disagree
 with actual subchunk blocks, then assert `column_samples` reports the real top
 block, overlay/water context when present, and
-`RenderLoadStats::raw_height_mismatch_columns` is non-zero. Raw heightmap
-behavior belongs in `RenderChunkRequest::RawHeightMap` tests.
+`ChunkLoadStats::raw_height_mismatch_columns` is non-zero. Raw heightmap
+behavior belongs in `ChunkDataRequest::new().height_map()` tests.
 
 Typed write tests should cover the storage-layer contract only:
 

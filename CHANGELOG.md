@@ -2,6 +2,24 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## 0.3.0 - 2026-07-14
+
+### Added
+
+- Added composable `ChunkDataRequest` loading, `ChunkData` results, chunk-record
+  batch queries, pending-tick overlays, storage cache policies, and shared
+  terrain-surface helpers.
+
+### Changed
+
+- Replaced the render-specific chunk-loading API with general chunk-query types
+  such as `ChunkLoadOptions`, `ChunkLoadPriority`, and
+  `WorldChunkQueryRegion`, so renderers and other consumers share one data
+  loading contract.
+- Updated the README, API guide, benchmarks, and testing guidance for the new
+  chunk-query and surface-data APIs.
+- Updated the optional `bedrock-leveldb` backend dependency to `0.3.0`.
+
 ## 0.2.2 - 2026-06-29
 
 ### Added
