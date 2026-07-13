@@ -2,6 +2,13 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## 0.3.3 - 2026-07-14
+
+### Fixed
+
+- Fixed the publish workflow to wait for the declared `bedrock-leveldb`
+  dependency version instead of the `bedrock-world` release version.
+
 ## 0.3.2 - 2026-07-14
 
 ### Fixed

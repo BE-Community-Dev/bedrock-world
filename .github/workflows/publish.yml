@@ -30,7 +30,7 @@ jobs:
           fi
       - name: Wait for bedrock-leveldb release
         run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          version="$(sed -n 's/^bedrock-leveldb = { version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
           for attempt in $(seq 1 30); do
             if cargo info "bedrock-leveldb@$version" >/dev/null 2>&1; then
               cargo info "bedrock-leveldb@$version"
