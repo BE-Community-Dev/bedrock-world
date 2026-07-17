@@ -881,7 +881,7 @@ fn record_world_key(
 #[must_use]
 /// Parse chunk records.
 pub fn parse_chunk_records(pos: ChunkPos, records: Vec<ChunkRecord>) -> ParsedChunkData {
-    parse_chunk_records_with_options(pos, records, WorldParseOptions::full())
+    parse_chunk_records_ref(pos, &records)
 }
 
 #[must_use]
@@ -891,9 +891,25 @@ pub fn parse_chunk_records_with_options(
     records: Vec<ChunkRecord>,
     options: WorldParseOptions,
 ) -> ParsedChunkData {
+    parse_chunk_records_ref_with_options(pos, &records, options)
+}
+
+#[must_use]
+/// Parse borrowed chunk records without consuming or cloning the source records.
+pub fn parse_chunk_records_ref(pos: ChunkPos, records: &[ChunkRecord]) -> ParsedChunkData {
+    parse_chunk_records_ref_with_options(pos, records, WorldParseOptions::full())
+}
+
+#[must_use]
+/// Parse borrowed chunk records with options without consuming or cloning the source records.
+pub fn parse_chunk_records_ref_with_options(
+    pos: ChunkPos,
+    records: &[ChunkRecord],
+    options: WorldParseOptions,
+) -> ParsedChunkData {
     let mut report = WorldParseReport::default();
     let parsed_records = records
-        .into_iter()
+        .iter()
         .map(|record| {
             *report
                 .key_kinds
@@ -2397,6 +2413,24 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn borrowed_chunk_record_parser_leaves_source_records_available() {
+        let pos = ChunkPos {
+            x: 4,
+            z: -7,
+            dimension: crate::Dimension::Overworld,
+        };
+        let records = vec![ChunkRecord {
+            key: crate::ChunkKey::new(pos, ChunkRecordTag::Version),
+            value: Bytes::from_static(&[42]),
+        }];
+
+        let parsed =
+            parse_chunk_records_ref_with_options(pos, &records, WorldParseOptions::summary());
+
+        assert_eq!((records[0].value[0], parsed.report.entry_count), (42, 1));
     }
 
     #[test]

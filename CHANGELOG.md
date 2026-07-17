@@ -2,6 +2,13 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## Unreleased
+
+### Added
+
+- Added borrowed chunk-record parsing APIs so callers can retain raw records
+  and build structured data from a single storage scan.
+
 ## 0.3.3 - 2026-07-14
 
 ### Fixed
