@@ -2,7 +2,7 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
-## Unreleased
+## 0.3.4 - 2026-07-17
 
 ### Added
 
