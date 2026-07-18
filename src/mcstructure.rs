@@ -6,9 +6,9 @@
 
 use crate::parsed::encode_consecutive_roots;
 use crate::{
-    BedrockWorld, BedrockWorldError, Biome3d, BlockPalette, BlockState, ChunkKey, ChunkPos,
-    ChunkRecord, ChunkRecordTag, NbtReader, NbtTag, NbtWriter, Result, SubChunkFormat,
-    WorldStorageHandle, WriteGuard, block_storage_index,
+    BedrockWorld, BedrockWorldError, Biome2d, Biome3d, BlockPalette, BlockState, ChunkKey,
+    ChunkPos, ChunkRecord, ChunkRecordTag, ChunkVersion, NbtReader, NbtTag, NbtWriter, Result,
+    SubChunkFormat, WorldStorageHandle, WriteGuard, block_storage_index,
 };
 use bytes::Bytes;
 use indexmap::IndexMap;
@@ -21,6 +21,7 @@ const DEFAULT_BLOCK_VERSION: i32 = 18_002_711;
 const AIR_BLOCK_NAME: &str = "minecraft:air";
 const BLOCKS_PER_SUBCHUNK: usize = 4096;
 const MAX_STRUCTURE_BLOCKS: i64 = 134_217_728;
+const WORLD_WRITE_CHUNK_BATCH_SIZE: usize = 16;
 
 /// 3D size of a Bedrock structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,17 +594,36 @@ impl McStructureFile {
             total: total_chunks,
         });
 
-        let mut affected_chunks = BTreeSet::new();
-        let mut transaction = world.transaction();
-        for (index, (chunk, subchunks)) in placements.into_iter().enumerate() {
-            let existing_chunk = world.get_chunk_blocking(chunk)?;
-            if !chunk_has_biome_record(&existing_chunk.records) {
-                transaction.put_raw_record(
-                    &ChunkKey::new(chunk, ChunkRecordTag::Data3D),
-                    default_data3d_bytes()?,
-                );
-            }
+        let affected_chunks =
+            Self::write_placed_chunks_blocking(world, placements, block_entities, &mut progress)?;
 
+        Ok(McStructureWriteResult {
+            affected_chunks,
+            placed_blocks: self.size.block_count()?,
+        })
+    }
+
+    fn write_placed_chunks_blocking<S>(
+        world: &BedrockWorld<S>,
+        placements: BTreeMap<ChunkPos, BTreeMap<i8, Vec<StructureBlockPlacement>>>,
+        mut block_entities: BTreeMap<ChunkPos, Vec<NbtTag>>,
+        progress: &mut impl FnMut(McStructureWriteProgress),
+    ) -> Result<BTreeSet<ChunkPos>>
+    where
+        S: WorldStorageHandle,
+    {
+        let total_chunks = placements.len();
+        let mut affected_chunks = BTreeSet::new();
+        let mut transaction = Some(world.transaction());
+        for (index, (chunk, subchunks)) in placements.into_iter().enumerate() {
+            let active_transaction = transaction.as_mut().ok_or_else(|| {
+                BedrockWorldError::ConcurrentWrite(
+                    "structure write transaction is unavailable".to_string(),
+                )
+            })?;
+            let existing_chunk = world.get_chunk_blocking(chunk)?;
+            let mut updated_subchunks = BTreeMap::new();
+            let mut touched_columns = [false; 256];
             for (subchunk_y, subchunk_placements) in subchunks {
                 let mut subchunk = EntrySubchunkBuilder::from_chunk(&existing_chunk, subchunk_y)?;
                 for placement in subchunk_placements {
@@ -614,13 +634,34 @@ impl McStructureFile {
                     );
                     subchunk.primary[storage_index] = placement.primary;
                     subchunk.secondary[storage_index] = placement.secondary;
+                    touched_columns
+                        [usize::from(placement.local_z) * 16 + usize::from(placement.local_x)] =
+                        true;
                 }
+                updated_subchunks.insert(subchunk_y, subchunk);
+            }
+
+            let (version, mut height_map) = chunk_height_map(&existing_chunk.records)?;
+            update_height_map_from_subchunks(
+                chunk,
+                version,
+                &existing_chunk,
+                &updated_subchunks,
+                &touched_columns,
+                &mut height_map,
+            )?;
+            let (height_map_tag, height_map_bytes) =
+                encode_chunk_height_map(&existing_chunk.records, height_map)?;
+            active_transaction
+                .put_raw_record(&ChunkKey::new(chunk, height_map_tag), height_map_bytes);
+
+            for (subchunk_y, subchunk) in updated_subchunks {
                 let bytes = encode_entry_subchunk(subchunk)?;
-                transaction
+                active_transaction
                     .put_raw_record(&ChunkKey::subchunk(chunk, subchunk_y), Bytes::from(bytes));
             }
 
-            transaction.put_raw_record(
+            active_transaction.put_raw_record(
                 &ChunkKey::new(chunk, ChunkRecordTag::FinalizedState),
                 Bytes::from(2_i32.to_le_bytes().to_vec()),
             );
@@ -642,23 +683,31 @@ impl McStructureFile {
                 roots.extend(structure_entities);
                 if !roots.is_empty() {
                     let value = encode_consecutive_roots(&roots)?;
-                    transaction
+                    active_transaction
                         .put_raw_record(&ChunkKey::new(chunk, ChunkRecordTag::BlockEntity), value);
                 }
             }
             affected_chunks.insert(chunk);
-            progress(McStructureWriteProgress {
-                phase: McStructureWritePhase::WriteChunks,
-                completed: index + 1,
-                total: total_chunks,
-            });
+            let completed = index + 1;
+            if completed.is_multiple_of(WORLD_WRITE_CHUNK_BATCH_SIZE) || completed == total_chunks {
+                let transaction_to_commit = transaction.take().ok_or_else(|| {
+                    BedrockWorldError::ConcurrentWrite(
+                        "structure write transaction is unavailable".to_string(),
+                    )
+                })?;
+                transaction_to_commit.commit()?;
+                progress(McStructureWriteProgress {
+                    phase: McStructureWritePhase::WriteChunks,
+                    completed,
+                    total: total_chunks,
+                });
+                if completed != total_chunks {
+                    transaction = Some(world.transaction());
+                }
+            }
         }
-        transaction.commit()?;
 
-        Ok(McStructureWriteResult {
-            affected_chunks,
-            placed_blocks: self.size.block_count()?,
-        })
+        Ok(affected_chunks)
     }
 
     fn structure_block_placement(
@@ -1068,17 +1117,111 @@ fn pack_palette_indices(indices: &[u16], bits: u8) -> Result<Vec<u32>> {
     Ok(words)
 }
 
-fn chunk_has_biome_record(records: &[ChunkRecord]) -> bool {
-    records.iter().any(|record| {
-        matches!(
-            record.key.tag,
-            ChunkRecordTag::Data2D | ChunkRecordTag::Data2DLegacy | ChunkRecordTag::Data3D
-        )
-    })
+fn chunk_height_map(records: &[ChunkRecord]) -> Result<(ChunkVersion, Vec<i16>)> {
+    for record in records {
+        match record.key.tag {
+            ChunkRecordTag::Data3D => {
+                return Biome3d::parse(&record.value)
+                    .map(|biome| (ChunkVersion::New, biome.height_map));
+            }
+            ChunkRecordTag::Data2D | ChunkRecordTag::Data2DLegacy => {
+                return Biome2d::parse(&record.value)
+                    .map(|biome| (ChunkVersion::Old, biome.height_map));
+            }
+            _ => {}
+        }
+    }
+    Ok((ChunkVersion::New, vec![0; 256]))
 }
 
-fn default_data3d_bytes() -> Result<Vec<u8>> {
-    Biome3d::new(vec![0; 256], Vec::new()).and_then(|biome| biome.encode())
+fn encode_chunk_height_map(
+    records: &[ChunkRecord],
+    height_map: Vec<i16>,
+) -> Result<(ChunkRecordTag, Bytes)> {
+    for record in records {
+        match record.key.tag {
+            ChunkRecordTag::Data3D => {
+                let biome = Biome3d::parse(&record.value)?;
+                let bytes = Biome3d::new(height_map, biome.storages)?.encode()?;
+                return Ok((ChunkRecordTag::Data3D, Bytes::from(bytes)));
+            }
+            ChunkRecordTag::Data2D | ChunkRecordTag::Data2DLegacy => {
+                let biome = Biome2d::parse(&record.value)?;
+                let bytes = Biome2d::new(height_map, biome.biomes)?.encode()?;
+                return Ok((record.key.tag, Bytes::from(bytes)));
+            }
+            _ => {}
+        }
+    }
+    let bytes = Biome3d::new(height_map, Vec::new())?.encode()?;
+    Ok((ChunkRecordTag::Data3D, Bytes::from(bytes)))
+}
+
+fn update_height_map_from_subchunks(
+    chunk: ChunkPos,
+    version: ChunkVersion,
+    existing_chunk: &crate::Chunk,
+    updated_subchunks: &BTreeMap<i8, EntrySubchunkBuilder>,
+    touched_columns: &[bool; 256],
+    height_map: &mut [i16],
+) -> Result<()> {
+    let (min_y, max_y) = chunk.y_range(version);
+    let min_subchunk = min_y.div_euclid(16);
+    let max_subchunk = max_y.div_euclid(16);
+    let mut unresolved = touched_columns.iter().filter(|touched| **touched).count();
+    let mut resolved = [false; 256];
+
+    for subchunk_y in (min_subchunk..=max_subchunk).rev() {
+        if unresolved == 0 {
+            break;
+        }
+        let subchunk_y = i8::try_from(subchunk_y).map_err(|_| {
+            BedrockWorldError::Validation(format!(
+                "chunk {},{} has an invalid subchunk index {subchunk_y}",
+                chunk.x, chunk.z
+            ))
+        })?;
+        let existing;
+        let subchunk = if let Some(updated) = updated_subchunks.get(&subchunk_y) {
+            updated
+        } else {
+            existing = EntrySubchunkBuilder::from_chunk(existing_chunk, subchunk_y)?;
+            &existing
+        };
+        for local_z in 0..16_u8 {
+            for local_x in 0..16_u8 {
+                let column_index = usize::from(local_z) * 16 + usize::from(local_x);
+                if !touched_columns[column_index] || resolved[column_index] {
+                    continue;
+                }
+                for local_y in (0..16_u8).rev() {
+                    let storage_index = block_storage_index(local_x, local_y, local_z);
+                    if !subchunk.primary[storage_index].is_air()
+                        || !subchunk.secondary[storage_index].is_air()
+                    {
+                        let surface_y = i32::from(subchunk_y) * 16 + i32::from(local_y);
+                        height_map[column_index] =
+                            i16::try_from(surface_y - min_y).map_err(|_| {
+                                BedrockWorldError::Validation(format!(
+                                    "chunk {},{} surface height {surface_y} is out of range",
+                                    chunk.x, chunk.z
+                                ))
+                            })?;
+                        resolved[column_index] = true;
+                        unresolved = unresolved.saturating_sub(1);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for (column_index, touched) in touched_columns.iter().enumerate() {
+        if *touched && !resolved[column_index] {
+            height_map[column_index] = 0;
+        }
+    }
+    Ok(())
 }
 
 fn checked_mul_16(value: i32, label: &str) -> Result<i32> {
@@ -1624,7 +1767,8 @@ fn nbt_i32_list(tag: &NbtTag) -> Result<Vec<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Dimension;
+    use crate::{Dimension, MemoryStorage, OpenOptions};
+    use std::sync::Arc;
 
     #[test]
     fn mcstructure_roundtrip_preserves_core_fields() {
@@ -1646,6 +1790,69 @@ mod tests {
         assert_eq!(parsed.palette.len(), 2);
         assert_eq!(parsed.primary_index_at(1, 2, 3).expect("primary"), 1);
         assert_eq!(parsed.primary_index_at(0, 0, 0).expect("air"), 0);
+    }
+
+    #[test]
+    fn structure_write_progress_reports_only_committed_chunk_batches() {
+        let size = McStructureSize::new(17 * 16, 1, 1).expect("valid structure size");
+        let structure = McStructureFile::new_air(size, [0, 0, 0]).expect("air structure");
+        let world = BedrockWorld::from_storage(
+            "memory",
+            Arc::new(MemoryStorage::new()),
+            OpenOptions {
+                read_only: false,
+                ..OpenOptions::default()
+            },
+        );
+        let target_anchor = ChunkPos {
+            x: 100,
+            z: -20,
+            dimension: Dimension::Overworld,
+        };
+        let guard = WriteGuard::confirmed("memory", "structure progress test");
+        let mut committed = Vec::new();
+
+        structure
+            .write_to_world_blocking(
+                &world,
+                McStructurePlacement {
+                    source_anchor: ChunkPos {
+                        x: 0,
+                        z: 0,
+                        dimension: Dimension::Overworld,
+                    },
+                    target_anchor,
+                    origin_y: 0,
+                    rotation: McStructureRotation::None,
+                    mirror_x: false,
+                    mirror_z: false,
+                },
+                &guard,
+                |progress| {
+                    if progress.phase != McStructureWritePhase::WriteChunks {
+                        return;
+                    }
+                    if progress.completed > 0 {
+                        let last_chunk = ChunkPos {
+                            x: target_anchor.x
+                                + i32::try_from(progress.completed - 1).expect("chunk offset"),
+                            ..target_anchor
+                        };
+                        assert!(
+                            world
+                                .get_chunk_blocking(last_chunk)
+                                .expect("read committed structure chunk")
+                                .records
+                                .iter()
+                                .any(|record| record.key.tag == ChunkRecordTag::Data3D)
+                        );
+                    }
+                    committed.push(progress.completed);
+                },
+            )
+            .expect("write structure");
+
+        assert_eq!(committed, [0, 16, 17]);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::{
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -432,7 +433,12 @@ impl WriteGuard {
         }
     }
 
-    pub(crate) fn validate<S>(&self, world: &BedrockWorld<S>) -> Result<()>
+    /// Validates that this guard authorizes writes to `world`.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors for an unconfirmed operation or mismatched world path.
+    pub fn validate<S>(&self, world: &BedrockWorld<S>) -> Result<()>
     where
         S: WorldStorageHandle,
     {
@@ -1168,19 +1174,34 @@ where
                 z: chunk_z,
                 dimension: bounds.dimension,
             };
-            for record in world.get_chunk_blocking(pos)?.records {
-                transaction.delete_raw_record(&record.key);
-                deleted = deleted.saturating_add(1);
-            }
-            let actor_digest_key = ActorDigestKey::new(pos).storage_key();
-            if let Some(digest) = world.storage().get(&actor_digest_key)? {
-                for actor_uid in parse_actor_digest_ids(&digest)? {
-                    transaction.delete_raw_key(actor_uid.storage_key());
-                    deleted = deleted.saturating_add(1);
-                }
-            }
-            transaction.delete_raw_key(actor_digest_key);
+            deleted = deleted.saturating_add(transaction.delete_chunk(pos)?);
         }
+    }
+    transaction.commit()?;
+    Ok(deleted)
+}
+
+/// Deletes an arbitrary set of chunk positions in one atomic storage batch.
+///
+/// Duplicate positions are ignored.
+///
+/// # Errors
+///
+/// Returns validation, storage, or actor-digest parse errors.
+pub fn delete_chunk_positions_blocking<S, I>(
+    world: &BedrockWorld<S>,
+    positions: I,
+    guard: &WriteGuard,
+) -> Result<usize>
+where
+    S: WorldStorageHandle,
+    I: IntoIterator<Item = ChunkPos>,
+{
+    guard.validate(world)?;
+    let mut deleted = 0usize;
+    let mut transaction = world.transaction();
+    for pos in positions.into_iter().collect::<BTreeSet<_>>() {
+        deleted = deleted.saturating_add(transaction.delete_chunk(pos)?);
     }
     transaction.commit()?;
     Ok(deleted)

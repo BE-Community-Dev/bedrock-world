@@ -2710,13 +2710,8 @@ where
         areas: &[ParsedHardcodedSpawnArea],
     ) -> Result<()> {
         self.ensure_writable()?;
-        let value = encode_hardcoded_spawn_area_records(areas)?;
-        parse_hardcoded_spawn_area_records(&value)?;
         let mut transaction = self.transaction();
-        transaction.put_raw_record(
-            &ChunkKey::new(pos, ChunkRecordTag::HardcodedSpawners),
-            value,
-        );
+        transaction.put_hsa_for_chunk(pos, areas)?;
         transaction.commit()
     }
 
@@ -2767,17 +2762,8 @@ where
         entities: &[ParsedBlockEntity],
     ) -> Result<()> {
         self.ensure_writable()?;
-        validate_block_entities_in_chunk(pos, entities)?;
-        let roots = entities
-            .iter()
-            .map(|entity| entity.nbt.clone())
-            .collect::<Vec<_>>();
-        let value = encode_consecutive_roots(&roots)?;
-        let mut report = WorldParseReport::default();
-        let parsed = parse_block_entities_from_value(&value, &mut report);
-        validate_block_entities_in_chunk(pos, &parsed)?;
         let mut transaction = self.transaction();
-        transaction.put_raw_record(&ChunkKey::new(pos, ChunkRecordTag::BlockEntity), value);
+        transaction.put_block_entities(pos, entities)?;
         transaction.commit()
     }
 
@@ -3551,6 +3537,81 @@ where
     /// Stages a raw key delete.
     pub fn delete_raw_key(&mut self, key: impl Into<Bytes>) {
         self.batch.delete(key.into());
+    }
+
+    /// Stages deletion of every raw record and modern actor owned by one chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or actor-digest parse errors.
+    pub fn delete_chunk(&mut self, pos: ChunkPos) -> Result<usize> {
+        let mut raw_keys = Vec::new();
+        self.storage.storage().for_each_prefix(
+            &chunk_record_prefix(pos),
+            StorageReadOptions::default(),
+            &mut |raw_key, _| {
+                if ChunkKey::decode(raw_key).is_ok_and(|key| key.pos == pos) {
+                    raw_keys.push(Bytes::copy_from_slice(raw_key));
+                }
+                Ok(StorageVisitorControl::Continue)
+            },
+        )?;
+        let mut deleted = raw_keys.len();
+        for raw_key in raw_keys {
+            self.batch.delete(raw_key);
+        }
+
+        let actor_digest_key = ActorDigestKey::new(pos).storage_key();
+        if let Some(digest) = self.storage.storage().get(&actor_digest_key)? {
+            for actor_uid in parse_actor_digest_ids(&digest)? {
+                self.batch.delete(actor_uid.storage_key());
+                deleted = deleted.saturating_add(1);
+            }
+        }
+        self.batch.delete(actor_digest_key);
+        Ok(deleted)
+    }
+
+    /// Stages a validated block-entity payload for one chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation or serialization errors.
+    pub fn put_block_entities(
+        &mut self,
+        pos: ChunkPos,
+        entities: &[ParsedBlockEntity],
+    ) -> Result<()> {
+        validate_block_entities_in_chunk(pos, entities)?;
+        let roots = entities
+            .iter()
+            .map(|entity| entity.nbt.clone())
+            .collect::<Vec<_>>();
+        let value = encode_consecutive_roots(&roots)?;
+        let mut report = WorldParseReport::default();
+        let parsed = parse_block_entities_from_value(&value, &mut report);
+        validate_block_entities_in_chunk(pos, &parsed)?;
+        self.put_raw_record(&ChunkKey::new(pos, ChunkRecordTag::BlockEntity), value);
+        Ok(())
+    }
+
+    /// Stages a validated hardcoded-spawn-area payload for one chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation or serialization errors.
+    pub fn put_hsa_for_chunk(
+        &mut self,
+        pos: ChunkPos,
+        areas: &[ParsedHardcodedSpawnArea],
+    ) -> Result<()> {
+        let value = encode_hardcoded_spawn_area_records(areas)?;
+        parse_hardcoded_spawn_area_records(&value)?;
+        self.put_raw_record(
+            &ChunkKey::new(pos, ChunkRecordTag::HardcodedSpawners),
+            value,
+        );
+        Ok(())
     }
 
     /// Stages a player record write using the player's storage key.
@@ -5340,6 +5401,79 @@ mod tests {
         assert_eq!(
             storage.get(&encoded).expect("get"),
             Some(Bytes::from_static(b"\x02"))
+        );
+    }
+
+    #[test]
+    fn transaction_replaces_chunk_records_and_typed_payloads_in_one_commit() {
+        let pos = ChunkPos {
+            x: 3,
+            z: -2,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        let old_key = ChunkKey::new(pos, ChunkRecordTag::Version);
+        storage
+            .put(&old_key.encode(), b"\x01")
+            .expect("put old chunk record");
+        let world = BedrockWorld::from_storage(
+            "memory",
+            storage.clone(),
+            OpenOptions {
+                read_only: false,
+                ..OpenOptions::default()
+            },
+        );
+        let block_entity = ParsedBlockEntity {
+            id: Some("Chest".to_string()),
+            position: Some([49, 64, -31]),
+            is_movable: None,
+            custom_name: None,
+            items: Vec::new(),
+            nbt: NbtTag::Compound(IndexMap::from([
+                ("id".to_string(), NbtTag::String("Chest".to_string())),
+                ("x".to_string(), NbtTag::Int(49)),
+                ("y".to_string(), NbtTag::Int(64)),
+                ("z".to_string(), NbtTag::Int(-31)),
+            ])),
+        };
+        let area = ParsedHardcodedSpawnArea {
+            kind: HardcodedSpawnAreaKind::NetherFortress,
+            min: [48, 32, -32],
+            max: [63, 80, -17],
+        };
+        let new_key = ChunkKey::new(pos, ChunkRecordTag::FinalizedState);
+
+        let mut transaction = world.transaction();
+        assert_eq!(transaction.delete_chunk(pos).expect("stage delete"), 1);
+        transaction.put_raw_record(&new_key, Bytes::from_static(b"\x02\0\0\0"));
+        transaction
+            .put_block_entities(pos, std::slice::from_ref(&block_entity))
+            .expect("stage block entities");
+        transaction
+            .put_hsa_for_chunk(pos, std::slice::from_ref(&area))
+            .expect("stage hardcoded spawn area");
+        transaction.commit().expect("commit replacement");
+
+        assert_eq!(storage.get(&old_key.encode()).expect("get old"), None);
+        assert_eq!(
+            storage.get(&new_key.encode()).expect("get new"),
+            Some(Bytes::from_static(b"\x02\0\0\0"))
+        );
+        assert_eq!(
+            world
+                .block_entities_in_chunk_blocking(pos)
+                .expect("read block entities")[0]
+                .entity
+                .position,
+            block_entity.position
+        );
+        assert_eq!(
+            world
+                .scan_hsa_records_blocking(WorldScanOptions::default())
+                .expect("read hardcoded spawn areas")[0]
+                .1,
+            vec![area]
         );
     }
 

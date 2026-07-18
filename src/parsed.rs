@@ -1658,6 +1658,9 @@ fn encode_biome_storage(storage: &ParsedBiomeStorage) -> WorldResult<Vec<u8>> {
             "biome storage palette cannot be empty".to_string(),
         ));
     }
+    if storage.palette.as_slice() == [u32::MAX] && storage.indices.is_none() {
+        return Ok(vec![0xff]);
+    }
     if storage.palette.len() == 1
         && storage
             .indices
@@ -2317,6 +2320,22 @@ mod tests {
         assert_eq!(
             Biome3d::parse(&data3d.encode().expect("encode")).expect("parse"),
             data3d
+        );
+
+        let inherited = Biome3d::new(
+            vec![0; 256],
+            vec![ParsedBiomeStorage {
+                y: Some(-64),
+                palette: vec![u32::MAX],
+                indices: None,
+                counts: vec![4096],
+            }],
+        )
+        .expect("inherited biome storage");
+        assert_eq!(
+            Biome3d::parse(&inherited.encode().expect("encode inherited"))
+                .expect("parse inherited"),
+            inherited
         );
     }
 

@@ -49,8 +49,9 @@ This crate focuses on complete parsing behavior. The
   `put_hsa_for_chunk_blocking`, `delete_hsa_for_chunk_blocking`,
   `put_block_entities_blocking`, `edit_block_entity_at_blocking`,
   `delete_block_entity_at_blocking`, `put_actor_blocking`,
-  `delete_actor_blocking`, and `move_actor_blocking`. Matching async wrappers
-  are available behind the default `async` feature.
+  `delete_actor_blocking`, `move_actor_blocking`, and
+  `delete_chunk_positions_blocking`. Matching async wrappers are available
+  behind the default `async` feature.
 - High-level writes serialize and parse records back before commit. Actor writes
   update `digp -> actorprefix` records in one transaction. Block-entity writes
   validate coordinates against the target chunk. `PocketChunksDatStorage`
@@ -69,7 +70,9 @@ This crate focuses on complete parsing behavior. The
 - `McStructureFile::read_from_path`, `McStructureFile::from_world_region_blocking`,
   and `McStructureFile::write_to_world_blocking` cover Bedrock
   `.mcstructure` import, export, and placement. Placement supports chunk
-  targeting, Y offsets, horizontal rotation/mirroring, and block entities.
+  targeting, Y offsets, horizontal rotation/mirroring, and block entities;
+  touched heightmap columns are recomputed and writes commit in 16-chunk
+  batches.
 - `WorldPipelineOptions` refines the bounded pipeline with queue depth, chunk
   batch size, subchunk decode worker budget, and progress cadence. Zero values
   choose automatic defaults.

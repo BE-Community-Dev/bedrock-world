@@ -2,6 +2,26 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## 0.3.5 - 2026-07-18
+
+### Added
+
+- Added atomic `delete_chunk_positions_blocking` support for deduplicated
+  multi-chunk deletion.
+- Added transaction helpers for replacing a chunk and staging validated block
+  entities or hardcoded spawn areas in one commit.
+
+### Changed
+
+- Made `WriteGuard::validate` public for callers that coordinate their own
+  storage transactions.
+- Structure placement now recalculates touched heightmap columns and commits
+  chunk writes in batches of 16, with progress reported after each commit.
+
+### Fixed
+
+- Preserved inherited biome storage entries during Data3D encoding.
+
 ## 0.3.4 - 2026-07-17
 
 ### Added

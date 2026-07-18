@@ -96,12 +96,12 @@ pub use query::{
     ChunkRecordQuery, ChunkRecordQueryResult, EntityOverlay, HardcodedSpawnAreaOverlay,
     PendingTickOverlay, RegionOverlayQuery, RegionOverlayQueryOptions, SelectionStats,
     SlimeChunkBounds, SlimeChunkWindow, SlimeWindowSize, VillageOverlay, VillageOverlayIndex,
-    WriteGuard, delete_chunks_blocking, fingerprint_chunk_records_many_blocking,
-    fingerprint_chunk_records_many_blocking_with_control, is_bedrock_slime_chunk, is_slime_chunk,
-    query_block_tip_blocking, query_chunk_detail_blocking, query_chunk_records_many_blocking,
-    query_chunk_records_many_blocking_with_control, query_region_overlays_blocking,
-    query_region_overlays_blocking_with_control, query_selection_stats_blocking,
-    query_slime_chunk_windows, write_chunk_record_nbt_blocking,
+    WriteGuard, delete_chunk_positions_blocking, delete_chunks_blocking,
+    fingerprint_chunk_records_many_blocking, fingerprint_chunk_records_many_blocking_with_control,
+    is_bedrock_slime_chunk, is_slime_chunk, query_block_tip_blocking, query_chunk_detail_blocking,
+    query_chunk_records_many_blocking, query_chunk_records_many_blocking_with_control,
+    query_region_overlays_blocking, query_region_overlays_blocking_with_control,
+    query_selection_stats_blocking, query_slime_chunk_windows, write_chunk_record_nbt_blocking,
 };
 pub use storage::{
     MemoryStorage, POCKET_CHUNKS_DAT_TERRAIN_VALUE_LEN, PocketChunksDatStorage, StorageBatch,

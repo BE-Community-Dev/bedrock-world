@@ -36,7 +36,8 @@ typed map/village/global record 访问，以及 Bedrock `.mcstructure` 文件导
   `put_hsa_for_chunk_blocking`、`delete_hsa_for_chunk_blocking`、
   `put_block_entities_blocking`、`edit_block_entity_at_blocking`、
   `delete_block_entity_at_blocking`、`put_actor_blocking`、
-  `delete_actor_blocking`、`move_actor_blocking`。默认 `async` feature 下有同名 async wrapper。
+  `delete_actor_blocking`、`move_actor_blocking`、
+  `delete_chunk_positions_blocking`。默认 `async` feature 下有同名 async wrapper。
 - 高层写入会先 serialize，再 parse 回来校验，然后才提交。actor 写入在一个 transaction
   中同步维护 `digp -> actorprefix`；方块实体写入会校验坐标仍属于目标 chunk。
   `PocketChunksDatStorage` 继续只读。
@@ -48,7 +49,8 @@ typed map/village/global record 访问，以及 Bedrock `.mcstructure` 文件导
 - `WorldScanOptions` 控制线程、取消和进度回调。
 - `McStructureFile::read_from_path`、`McStructureFile::from_world_region_blocking`
   和 `McStructureFile::write_to_world_blocking` 支持 Bedrock `.mcstructure`
-  导入、导出和放置；放置支持 chunk anchor、Y 偏移、水平旋转/镜像和方块实体。
+  导入、导出和放置；放置支持 chunk anchor、Y 偏移、水平旋转/镜像和方块实体，
+  会重算受影响的 heightmap 列，并按每 16 个 chunk 分批提交。
 - `WorldPipelineOptions` 进一步控制有界 pipeline 的队列深度、chunk batch 大小、
   subchunk decode worker 预算和进度间隔。字段为 0 时使用自动策略。
 - 渲染专用 API 现在有独立快路径：

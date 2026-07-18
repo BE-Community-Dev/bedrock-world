@@ -203,6 +203,10 @@ Chunk payload helpers:
 - `actors_in_chunk_blocking`, `put_actor_blocking`, `delete_actor_blocking`,
   and `move_actor_blocking` cover legacy inline `Entity` reads and modern
   `digp -> actorprefix` writes.
+- `delete_chunk_positions_blocking` removes a deduplicated set of chunks and
+  their modern actor records in one atomic storage batch. The lower-level
+  `StorageBatch` API also exposes `delete_chunk`, `put_block_entities`, and
+  `put_hsa_for_chunk` for composing a replacement commit.
 
 All high-level writes validate the serialized value by parsing it back before
 committing. Actor writes update `actorprefix` and `digp` in one transaction.
@@ -248,6 +252,11 @@ let result = structure.write_to_world_blocking(
 )?;
 println!("placed chunks={}", result.touched_chunks.len());
 ```
+
+Placement recomputes the heightmap columns touched by the new blocks and
+commits world changes in batches of 16 chunks. `WriteChunks` progress events
+are emitted after each batch is committed, so callers can safely refresh data
+after the reported count.
 
 Placement updates subchunk records, preserves supported block entities, and
 applies horizontal rotation or mirroring to common direction-like block states.
