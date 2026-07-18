@@ -40,7 +40,7 @@ backend-bedrock-leveldb = ["dep:bedrock-leveldb", "bedrock-leveldb/zlib", "bedro
 leveldb-mmap = ["backend-bedrock-leveldb", "bedrock-leveldb/mmap"]
 
 [dependencies]
-bedrock-leveldb = { version = "0.3.1", path = "../bedrock-leveldb", default-features = false, optional = true }
+bedrock-leveldb = { version = "0.3.1", git = "https://github.com/BE-Community-Dev/bedrock-leveldb.git", branch = "main", default-features = false, optional = true }
 bytes = "1.10.1"
 indexmap = { version = "2.12.1", features = ["serde"] }
 log = "0.4"
