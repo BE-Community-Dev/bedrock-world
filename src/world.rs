@@ -6,9 +6,10 @@
 //! wrappers that offload the same work with `tokio::task::spawn_blocking`.
 
 use crate::chunk::{
-    ActorDigestKey, ActorUid, BedrockDbKey, BlockPos, BlockState, Chunk, ChunkKey, ChunkPos,
-    ChunkRecord, ChunkRecordTag, ChunkVersion, GlobalRecordKind, LegacyBiomeSample, LegacyTerrain,
-    MapRecordId, SubChunk, SubChunkDecodeMode, parse_subchunk_with_mode,
+    ActorDigestKey, ActorUid, BedrockDbKey, BedrockDbKeyKind, BlockPos, BlockState,
+    BlockStatePaletteEntry, Chunk, ChunkKey, ChunkPos, ChunkRecord, ChunkRecordTag, ChunkVersion,
+    GlobalRecordKind, LegacyBiomeSample, LegacyTerrain, MapRecordId, SubChunk, SubChunkDecodeMode,
+    block_storage_index, parse_subchunk_with_mode,
 };
 use crate::error::{BedrockWorldError, Result};
 use crate::level_dat::{LevelDatDocument, read_level_dat_document, write_level_dat_document};
@@ -35,11 +36,12 @@ pub use crate::surface::{TerrainSurfaceRole, terrain_surface_overlay_alpha, terr
 use crate::surface::{is_air_block_name, is_water_block_name};
 use bytes::Bytes;
 use rayon::{ThreadPoolBuilder, prelude::*};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -422,7 +424,7 @@ pub struct TerrainColumnSample {
 #[derive(Debug, Clone, PartialEq)]
 /// Fixed 16x16 terrain column sample grid.
 pub struct TerrainColumnSamples {
-    columns: Vec<Option<TerrainColumnSample>>,
+    columns: Box<[Option<TerrainColumnSample>; 16 * 16]>,
 }
 
 impl TerrainColumnSamples {
@@ -430,7 +432,7 @@ impl TerrainColumnSamples {
     /// Creates a new value.
     pub fn new() -> Self {
         Self {
-            columns: vec![None; 16 * 16],
+            columns: Box::new(std::array::from_fn(|_| None)),
         }
     }
 
@@ -1221,6 +1223,7 @@ where
         options: WorldScanOptions,
     ) -> Result<BTreeMap<String, usize>> {
         let mut counts = BTreeMap::new();
+        let mut allocation_free_counts = HashMap::<BedrockDbKeyKind, usize>::new();
         let mut entries_seen = 0usize;
         self.storage()
             .for_each_key(to_storage_read_options(&options), &mut |key| {
@@ -1229,10 +1232,21 @@ where
                 if entries_seen.is_multiple_of(8192) {
                     emit_progress(&options, entries_seen);
                 }
-                let key = BedrockDbKey::decode(key);
-                *counts.entry(key.summary_kind()).or_default() += 1;
+                let kind = BedrockDbKeyKind::classify(key);
+                if matches!(
+                    kind,
+                    BedrockDbKeyKind::Other | BedrockDbKeyKind::Village | BedrockDbKeyKind::Global
+                ) {
+                    let key = BedrockDbKey::decode(key);
+                    *counts.entry(key.summary_kind()).or_default() += 1;
+                } else {
+                    *allocation_free_counts.entry(kind).or_default() += 1;
+                }
                 Ok(StorageVisitorControl::Continue)
             })?;
+        for (kind, count) in allocation_free_counts {
+            *counts.entry(kind.summary_kind()).or_default() += count;
+        }
         emit_progress(&options, entries_seen);
         Ok(counts)
     }
@@ -4101,7 +4115,54 @@ fn render_biome_colors_from_legacy_terrain(terrain: &LegacyTerrain) -> [[Option<
 struct SurfaceProjection<'a> {
     min_subchunk_y: i8,
     subchunks: Vec<Option<&'a SubChunk>>,
-    roles: Vec<Option<Vec<Vec<TerrainSurfaceRole>>>>,
+    storages: Vec<Option<Vec<SurfaceStorageProjection<'a>>>>,
+}
+
+struct SurfaceStorageProjection<'a> {
+    states: &'a [BlockState],
+    roles: Vec<TerrainSurfaceRole>,
+    indices: Cow<'a, [u16]>,
+}
+
+struct ProjectedSurfaceEntry<'a> {
+    entry: BlockStatePaletteEntry<'a>,
+    role: TerrainSurfaceRole,
+}
+
+struct ProjectedSurfaceStatesAt<'projection, 'chunk> {
+    storages: std::iter::Rev<
+        std::iter::Enumerate<std::slice::Iter<'projection, SurfaceStorageProjection<'chunk>>>,
+    >,
+    block_index: usize,
+}
+
+impl<'chunk> Iterator for ProjectedSurfaceStatesAt<'_, 'chunk> {
+    type Item = ProjectedSurfaceEntry<'chunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (storage_index, storage) in &mut self.storages {
+            let Some(palette_index) = storage.indices.get(self.block_index).copied() else {
+                continue;
+            };
+            let palette_index = usize::from(palette_index);
+            let Some(state) = storage.states.get(palette_index) else {
+                continue;
+            };
+            let Some(role) = storage.roles.get(palette_index).copied() else {
+                continue;
+            };
+            if role != TerrainSurfaceRole::Air {
+                return Some(ProjectedSurfaceEntry {
+                    entry: BlockStatePaletteEntry {
+                        state,
+                        storage_index,
+                    },
+                    role,
+                });
+            }
+        }
+        None
+    }
 }
 
 impl<'a> SurfaceProjection<'a> {
@@ -4113,25 +4174,27 @@ impl<'a> SurfaceProjection<'a> {
             .saturating_add(1);
         let len = usize::try_from(span).ok()?;
         let mut projected = vec![None; len];
-        let mut roles = vec![None; len];
+        let mut storage_projection = (0..len).map(|_| None).collect::<Vec<_>>();
         for (&y, subchunk) in subchunks {
             let index = i16::from(y).saturating_sub(i16::from(min_subchunk_y));
             if let Ok(index) = usize::try_from(index) {
                 if let Some(slot) = projected.get_mut(index) {
                     *slot = Some(subchunk);
-                    roles[index] = match &subchunk.format {
-                        crate::chunk::SubChunkFormat::Paletted { storages, .. } => Some(
-                            storages
-                                .iter()
-                                .map(|storage| {
-                                    storage
+                    storage_projection[index] = match &subchunk.format {
+                        crate::chunk::SubChunkFormat::Paletted { storages, .. } => storages
+                            .iter()
+                            .map(|storage| {
+                                Some(SurfaceStorageProjection {
+                                    states: &storage.states,
+                                    roles: storage
                                         .states
                                         .iter()
                                         .map(|state| terrain_surface_role(&state.name))
-                                        .collect()
+                                        .collect(),
+                                    indices: storage.surface_indices()?,
                                 })
-                                .collect(),
-                        ),
+                            })
+                            .collect::<Option<Vec<_>>>(),
                         _ => None,
                     };
                 }
@@ -4140,7 +4203,7 @@ impl<'a> SurfaceProjection<'a> {
         Some(Self {
             min_subchunk_y,
             subchunks: projected,
-            roles,
+            storages: storage_projection,
         })
     }
 
@@ -4152,20 +4215,20 @@ impl<'a> SurfaceProjection<'a> {
             .copied()
     }
 
-    fn role_for(
+    fn surface_states_at(
         &self,
         y: i8,
-        storage_index: usize,
-        palette_index: usize,
-    ) -> Option<TerrainSurfaceRole> {
+        local_x: u8,
+        local_y: u8,
+        local_z: u8,
+    ) -> Option<ProjectedSurfaceStatesAt<'_, 'a>> {
         let index =
             usize::try_from(i16::from(y).checked_sub(i16::from(self.min_subchunk_y))?).ok()?;
-        self.roles
-            .get(index)?
-            .as_ref()?
-            .get(storage_index)?
-            .get(palette_index)
-            .copied()
+        let storages = self.storages.get(index)?.as_ref()?;
+        Some(ProjectedSurfaceStatesAt {
+            storages: storages.iter().enumerate().rev(),
+            block_index: block_storage_index(local_x, local_y, local_z),
+        })
     }
 }
 
@@ -4233,28 +4296,48 @@ fn sample_column_top_down(
         })?;
         let mut saw_subchunk_layer = false;
         if let Some(subchunk) = projection.and_then(|projection| projection.get(subchunk_y)) {
-            for entry in subchunk.visible_block_surface_states_at(local_x, local_y, local_z) {
-                saw_subchunk_layer = true;
-                let role = projection
-                    .and_then(|projection| {
-                        projection.role_for(subchunk_y, entry.storage_index, entry.palette_index)
-                    })
-                    .unwrap_or_else(|| terrain_surface_role(&entry.state.name));
-                if let Some(sample) = scan_terrain_surface_state(
-                    local_x,
-                    local_z,
-                    y,
-                    height,
-                    entry.state,
-                    role,
-                    TerrainSampleSource::Subchunk,
-                    &mut overlay,
-                    &mut top_water,
-                    &mut water_depth,
-                    legacy_biomes,
-                    render_biomes,
-                ) {
-                    return Ok(Some(sample));
+            if let Some(projected_states) = projection.and_then(|projection| {
+                projection.surface_states_at(subchunk_y, local_x, local_y, local_z)
+            }) {
+                for projected in projected_states {
+                    saw_subchunk_layer = true;
+                    if let Some(sample) = scan_terrain_surface_state(
+                        local_x,
+                        local_z,
+                        y,
+                        height,
+                        projected.entry.state,
+                        projected.role,
+                        TerrainSampleSource::Subchunk,
+                        &mut overlay,
+                        &mut top_water,
+                        &mut water_depth,
+                        legacy_biomes,
+                        render_biomes,
+                    ) {
+                        return Ok(Some(sample));
+                    }
+                }
+            } else {
+                for entry in subchunk.visible_block_surface_states_at(local_x, local_y, local_z) {
+                    saw_subchunk_layer = true;
+                    let role = terrain_surface_role(&entry.state.name);
+                    if let Some(sample) = scan_terrain_surface_state(
+                        local_x,
+                        local_z,
+                        y,
+                        height,
+                        entry.state,
+                        role,
+                        TerrainSampleSource::Subchunk,
+                        &mut overlay,
+                        &mut top_water,
+                        &mut water_depth,
+                        legacy_biomes,
+                        render_biomes,
+                    ) {
+                        return Ok(Some(sample));
+                    }
                 }
             }
             if saw_subchunk_layer {

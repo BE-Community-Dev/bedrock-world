@@ -11,6 +11,7 @@ use crate::surface::is_air_block_name;
 use bytes::Bytes;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 const MAX_SUBCHUNK_PALETTE_LEN: usize = 4096;
@@ -682,6 +683,136 @@ impl BedrockDbKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Allocation-free category for a raw Bedrock database key.
+pub enum BedrockDbKeyKind {
+    /// Chunk-scoped record and its record tag.
+    Chunk(ChunkRecordTag),
+    /// Local player record.
+    LocalPlayer,
+    /// Remote player record.
+    RemotePlayer,
+    /// Actor payload record.
+    ActorPrefix,
+    /// Actor digest record.
+    ActorDigest,
+    /// Map record.
+    Map,
+    /// Village record.
+    Village,
+    /// Known global record.
+    Global,
+    /// Unclassified key.
+    Other,
+}
+
+impl BedrockDbKeyKind {
+    #[must_use]
+    /// Classifies a raw database key without allocating.
+    pub fn classify(key: &[u8]) -> Self {
+        if key == b"~local_player" || key == b"LocalPlayer" {
+            return Self::LocalPlayer;
+        }
+        if key.starts_with(b"player_") {
+            return Self::RemotePlayer;
+        }
+        if key.starts_with(b"actorprefix") {
+            return Self::ActorPrefix;
+        }
+        if key.starts_with(b"digp") {
+            return Self::ActorDigest;
+        }
+        if key.starts_with(b"map_") {
+            return Self::Map;
+        }
+        if key.starts_with(b"VILLAGE_") {
+            return Self::Village;
+        }
+        if is_known_global_key(key) {
+            return Self::Global;
+        }
+        encoded_chunk_tag(key).map_or(Self::Other, Self::Chunk)
+    }
+
+    #[must_use]
+    /// Returns the stable summary label for this category.
+    pub fn summary_kind(self) -> String {
+        match self {
+            Self::Chunk(tag) => format!("Chunk::{tag:?}"),
+            Self::LocalPlayer => "LocalPlayer".to_string(),
+            Self::RemotePlayer => "RemotePlayer".to_string(),
+            Self::ActorPrefix => "ActorPrefix".to_string(),
+            Self::ActorDigest => "ActorDigest".to_string(),
+            Self::Map => "Map".to_string(),
+            Self::Village => "Village".to_string(),
+            Self::Global => "Global".to_string(),
+            Self::Other => "Other".to_string(),
+        }
+    }
+}
+
+fn is_known_global_key(key: &[u8]) -> bool {
+    const GLOBAL_KEYS: &[&[u8]] = &[
+        b"mobevents",
+        b"Overworld",
+        b"Nether",
+        b"TheEnd",
+        b"scoreboard",
+        b"AutonomousEntities",
+        b"autonomousentities",
+        b"BiomeData",
+        b"LevelChunkMetaDataDictionary",
+        b"WorldClocks",
+        b"portals",
+        b"schedulerWT",
+        b"game_flatworldlayers",
+    ];
+    GLOBAL_KEYS.contains(&key)
+}
+
+fn encoded_chunk_tag(key: &[u8]) -> Option<ChunkRecordTag> {
+    let tag_index = match key.len() {
+        9 | 10 => 8,
+        13 | 14 => 12,
+        _ => return None,
+    };
+    let tag = ChunkRecordTag::from_byte(*key.get(tag_index)?);
+    (!matches!(tag, ChunkRecordTag::Unknown(_))).then_some(tag)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Stack-encoded Bedrock chunk key.
+pub struct EncodedChunkKey {
+    bytes: [u8; 14],
+    len: u8,
+}
+
+impl EncodedChunkKey {
+    #[must_use]
+    /// Returns the encoded key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    #[must_use]
+    /// Returns the encoded key length.
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[must_use]
+    /// Returns whether the encoded key is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl AsRef<[u8]> for EncodedChunkKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 /// Decoded chunk storage key with position, tag, and optional subchunk index.
 pub struct ChunkKey {
@@ -715,23 +846,32 @@ impl ChunkKey {
     }
 
     #[must_use]
-    /// Encodes this value into Bedrock storage bytes.
-    pub fn encode(&self) -> Bytes {
-        let mut bytes = Vec::with_capacity(if self.pos.dimension == Dimension::Overworld {
-            10
-        } else {
-            14
-        });
-        bytes.extend_from_slice(&self.pos.x.to_le_bytes());
-        bytes.extend_from_slice(&self.pos.z.to_le_bytes());
+    /// Encodes this value into a stack-backed key.
+    pub fn encode_inline(&self) -> EncodedChunkKey {
+        let mut bytes = [0_u8; 14];
+        bytes[..4].copy_from_slice(&self.pos.x.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.pos.z.to_le_bytes());
+        let mut len = 8_usize;
         if self.pos.dimension != Dimension::Overworld {
-            bytes.extend_from_slice(&self.pos.dimension.id().to_le_bytes());
+            bytes[len..len + 4].copy_from_slice(&self.pos.dimension.id().to_le_bytes());
+            len += 4;
         }
-        bytes.push(self.tag.byte());
+        bytes[len] = self.tag.byte();
+        len += 1;
         if let Some(y) = self.subchunk_y {
-            bytes.push(y.to_ne_bytes()[0]);
+            bytes[len] = y.to_ne_bytes()[0];
+            len += 1;
         }
-        Bytes::from(bytes)
+        EncodedChunkKey {
+            bytes,
+            len: u8::try_from(len).unwrap_or(14),
+        }
+    }
+
+    #[must_use]
+    /// Encodes this value into owned Bedrock storage bytes.
+    pub fn encode(&self) -> Bytes {
+        Bytes::copy_from_slice(self.encode_inline().as_bytes())
     }
 
     /// Decodes this value from Bedrock storage bytes.
@@ -831,6 +971,30 @@ impl PackedPaletteIndices {
         let value = ((word >> (item_index * usize::from(self.bits_per_block))) & mask) as u16;
         (usize::from(value) < self.palette_len).then_some(value)
     }
+
+    fn decode_all(&self) -> Option<Vec<u16>> {
+        if self.bits_per_block == 0 {
+            return Some(vec![0; 4096]);
+        }
+        let values_per_word = usize::from(32 / self.bits_per_block);
+        let mask = (1_u32 << self.bits_per_block) - 1;
+        let mut values = Vec::with_capacity(4096);
+        for word_bytes in self.bytes.chunks_exact(4) {
+            let word = u32::from_le_bytes(word_bytes.try_into().ok()?);
+            for item_index in 0..values_per_word {
+                if values.len() == 4096 {
+                    return Some(values);
+                }
+                let value =
+                    ((word >> (item_index * usize::from(self.bits_per_block))) & mask) as u16;
+                if usize::from(value) >= self.palette_len {
+                    return None;
+                }
+                values.push(value);
+            }
+        }
+        (values.len() == 4096).then_some(values)
+    }
 }
 
 impl BlockPalette {
@@ -884,8 +1048,14 @@ impl BlockPalette {
         Some(BlockStatePaletteEntry {
             state,
             storage_index: 0,
-            palette_index,
         })
+    }
+
+    pub(crate) fn surface_indices(&self) -> Option<Cow<'_, [u16]>> {
+        if let Some(indices) = &self.indices {
+            return (indices.len() >= 4096).then(|| Cow::Borrowed(&indices[..4096]));
+        }
+        self.packed_indices.as_ref()?.decode_all().map(Cow::Owned)
     }
 }
 
@@ -893,7 +1063,6 @@ impl BlockPalette {
 pub(crate) struct BlockStatePaletteEntry<'chunk> {
     pub(crate) state: &'chunk BlockState,
     pub(crate) storage_index: usize,
-    pub(crate) palette_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1948,6 +2117,31 @@ mod tests {
 
         assert_eq!(encoded.len(), 10);
         assert_eq!(ChunkKey::decode(&encoded).expect("decode"), key);
+        assert_eq!(key.encode_inline().as_bytes(), encoded.as_ref());
+        assert_eq!(
+            BedrockDbKeyKind::classify(&encoded),
+            BedrockDbKeyKind::Chunk(ChunkRecordTag::SubChunkPrefix)
+        );
+    }
+
+    #[test]
+    fn key_kind_classification_handles_common_non_chunk_keys_without_decoding() {
+        assert_eq!(
+            BedrockDbKeyKind::classify(b"~local_player"),
+            BedrockDbKeyKind::LocalPlayer
+        );
+        assert_eq!(
+            BedrockDbKeyKind::classify(b"player_123"),
+            BedrockDbKeyKind::RemotePlayer
+        );
+        assert_eq!(
+            BedrockDbKeyKind::classify(b"actorprefix12345678"),
+            BedrockDbKeyKind::ActorPrefix
+        );
+        assert_eq!(
+            BedrockDbKeyKind::classify(b"unclassified"),
+            BedrockDbKeyKind::Other
+        );
     }
 
     #[test]
@@ -2389,21 +2583,15 @@ mod tests {
         assert_eq!(storages.len(), 3);
         let visible_entries = subchunk
             .visible_block_surface_states_at(1, 2, 3)
-            .map(|entry| {
-                (
-                    entry.storage_index,
-                    entry.palette_index,
-                    entry.state.name.as_str(),
-                )
-            })
+            .map(|entry| (entry.storage_index, entry.state.name.as_str()))
             .collect::<Vec<_>>();
 
         assert_eq!(
             visible_entries,
             [
-                (2, 1, "minecraft:stone"),
-                (1, 1, "minecraft:short_grass"),
-                (0, 1, "minecraft:water")
+                (2, "minecraft:stone"),
+                (1, "minecraft:short_grass"),
+                (0, "minecraft:water")
             ]
         );
     }

@@ -2,6 +2,28 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## 0.4.0 - 2026-08-04
+
+### Added
+
+- Added stack-backed `EncodedChunkKey` encoding and allocation-free
+  `BedrockDbKeyKind` classification for storage hot paths.
+- Added callback-based `visit_nbt_events` / `NbtView::visit_events` parsing
+  with immediate early termination and no intermediate event vector.
+- Forwarded exact-get and native cache counters through `StorageScanOutcome`.
+
+### Changed
+
+- Updated the optional `bedrock-leveldb` backend to 0.4.0.
+- Exact surface projection decodes packed palette words once per storage,
+  precomputes terrain roles, and stores results in a fixed 16×16 column grid.
+- Writable LevelDB worlds use a bounded 4 MiB write buffer.
+
+### Fixed
+
+- `BedrockLevelDbStorage::flush` and `compact` now call the underlying
+  database instead of returning success without doing any work.
+
 ## 0.3.5 - 2026-07-18
 
 ### Added

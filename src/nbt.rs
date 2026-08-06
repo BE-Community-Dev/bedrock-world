@@ -9,6 +9,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::io::{Cursor, Read, Write};
+use std::ops::ControlFlow;
 
 const MAX_NBT_DEPTH: usize = 128;
 const MAX_NBT_CONTAINER_LENGTH: usize = 134_217_728;
@@ -176,6 +177,13 @@ impl<'a> NbtView<'a> {
     /// Parses the payload into a flat stream of borrowed NBT events.
     pub fn events(&self) -> Result<Vec<NbtEvent<'a>>> {
         parse_nbt_events(self.data)
+    }
+
+    /// Visits borrowed NBT events without materializing an event vector.
+    ///
+    /// Returning [`ControlFlow::Break`] stops parsing immediately.
+    pub fn visit_events(&self, visitor: impl FnMut(NbtEvent<'a>) -> ControlFlow<()>) -> Result<()> {
+        visit_nbt_events(self.data, visitor)
     }
 }
 
@@ -738,6 +746,27 @@ fn write_i32_len(writer: &mut impl Write, len: usize) -> Result<()> {
 }
 
 fn parse_nbt_events(data: &[u8]) -> Result<Vec<NbtEvent<'_>>> {
+    let mut events = Vec::new();
+    visit_nbt_events(data, |event| {
+        events.push(event);
+        ControlFlow::Continue(())
+    })?;
+    Ok(events)
+}
+
+/// Visits a flat stream of borrowed NBT events without allocating a DOM or
+/// intermediate event vector.
+///
+/// Returning [`ControlFlow::Break`] stops parsing immediately.
+///
+/// # Errors
+///
+/// Returns an error when the payload is truncated, malformed, exceeds parser
+/// limits, or does not contain a compound root.
+pub fn visit_nbt_events<'a>(
+    data: &'a [u8],
+    mut visitor: impl FnMut(NbtEvent<'a>) -> ControlFlow<()>,
+) -> Result<()> {
     let mut reader = SliceNbtReader::new(data);
     let tag_type = reader.read_u8()?;
     if tag_type != TAG_COMPOUND {
@@ -746,83 +775,70 @@ fn parse_nbt_events(data: &[u8]) -> Result<Vec<NbtEvent<'_>>> {
         ));
     }
     let name = reader.read_string_ref()?;
-    let mut events = Vec::new();
-    parse_event_payload(&mut reader, tag_type, Some(name), 0, &mut events)?;
-    Ok(events)
+    let _ = visit_event_payload(&mut reader, tag_type, Some(name), 0, &mut visitor)?;
+    Ok(())
 }
 
-fn parse_event_payload<'a>(
+fn visit_event_payload<'a, F>(
     reader: &mut SliceNbtReader<'a>,
     tag_type: u8,
     name: Option<&'a str>,
     depth: usize,
-    events: &mut Vec<NbtEvent<'a>>,
-) -> Result<()> {
+    visitor: &mut F,
+) -> Result<ControlFlow<()>>
+where
+    F: FnMut(NbtEvent<'a>) -> ControlFlow<()>,
+{
+    macro_rules! emit {
+        ($event:expr) => {
+            if visitor($event).is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        };
+    }
+
     ensure_depth(depth, tag_type)?;
     match tag_type {
-        TAG_BYTE => events.push(NbtEvent::Byte {
+        TAG_BYTE => emit!(NbtEvent::Byte {
             name,
             value: reader.read_i8()?,
         }),
-        TAG_SHORT => events.push(NbtEvent::Short {
+        TAG_SHORT => emit!(NbtEvent::Short {
             name,
             value: reader.read_i16()?,
         }),
-        TAG_INT => events.push(NbtEvent::Int {
+        TAG_INT => emit!(NbtEvent::Int {
             name,
             value: reader.read_i32()?,
         }),
-        TAG_LONG => events.push(NbtEvent::Long {
+        TAG_LONG => emit!(NbtEvent::Long {
             name,
             value: reader.read_i64()?,
         }),
-        TAG_FLOAT => events.push(NbtEvent::Float {
+        TAG_FLOAT => emit!(NbtEvent::Float {
             name,
             value: reader.read_f32()?,
         }),
-        TAG_DOUBLE => events.push(NbtEvent::Double {
+        TAG_DOUBLE => emit!(NbtEvent::Double {
             name,
             value: reader.read_f64()?,
         }),
         TAG_BYTE_ARRAY => {
             let len = reader.read_byte_length("ByteArray")?;
-            events.push(NbtEvent::ByteArray {
+            emit!(NbtEvent::ByteArray {
                 name,
                 bytes: reader.take(len)?,
             });
         }
-        TAG_STRING => events.push(NbtEvent::String {
+        TAG_STRING => emit!(NbtEvent::String {
             name,
             value: reader.read_string_ref()?,
         }),
-        TAG_LIST => {
-            let element_type = reader.read_u8()?;
-            let len = reader.read_container_length("List")?;
-            events.push(NbtEvent::BeginList {
-                name,
-                element_type,
-                len,
-            });
-            for _ in 0..len {
-                parse_event_payload(reader, element_type, None, depth + 1, events)?;
-            }
-            events.push(NbtEvent::EndList);
-        }
-        TAG_COMPOUND => {
-            events.push(NbtEvent::BeginCompound { name });
-            loop {
-                let child_type = reader.read_u8()?;
-                if child_type == TAG_END {
-                    break;
-                }
-                let child_name = reader.read_string_ref()?;
-                parse_event_payload(reader, child_type, Some(child_name), depth + 1, events)?;
-            }
-            events.push(NbtEvent::EndCompound);
-        }
+        TAG_LIST => return visit_list_events(reader, name, depth, visitor),
+        TAG_COMPOUND => return visit_compound_events(reader, name, depth, visitor),
         TAG_INT_ARRAY => {
             let len = reader.read_container_length("IntArray")?;
-            events.push(NbtEvent::IntArray {
+            emit!(NbtEvent::IntArray {
                 name,
                 bytes: reader.take_array_bytes(len, 4, "IntArray")?,
                 len,
@@ -830,7 +846,7 @@ fn parse_event_payload<'a>(
         }
         TAG_LONG_ARRAY => {
             let len = reader.read_container_length("LongArray")?;
-            events.push(NbtEvent::LongArray {
+            emit!(NbtEvent::LongArray {
                 name,
                 bytes: reader.take_array_bytes(len, 8, "LongArray")?,
                 len,
@@ -838,7 +854,7 @@ fn parse_event_payload<'a>(
         }
         TAG_SHORT_ARRAY => {
             let len = reader.read_container_length("ShortArray")?;
-            events.push(NbtEvent::ShortArray {
+            emit!(NbtEvent::ShortArray {
                 name,
                 bytes: reader.take_array_bytes(len, 2, "ShortArray")?,
                 len,
@@ -851,7 +867,61 @@ fn parse_event_payload<'a>(
             )));
         }
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
+}
+
+fn visit_list_events<'a, F>(
+    reader: &mut SliceNbtReader<'a>,
+    name: Option<&'a str>,
+    depth: usize,
+    visitor: &mut F,
+) -> Result<ControlFlow<()>>
+where
+    F: FnMut(NbtEvent<'a>) -> ControlFlow<()>,
+{
+    let element_type = reader.read_u8()?;
+    let len = reader.read_container_length("List")?;
+    if visitor(NbtEvent::BeginList {
+        name,
+        element_type,
+        len,
+    })
+    .is_break()
+    {
+        return Ok(ControlFlow::Break(()));
+    }
+    for _ in 0..len {
+        if visit_event_payload(reader, element_type, None, depth + 1, visitor)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+    }
+    Ok(visitor(NbtEvent::EndList))
+}
+
+fn visit_compound_events<'a, F>(
+    reader: &mut SliceNbtReader<'a>,
+    name: Option<&'a str>,
+    depth: usize,
+    visitor: &mut F,
+) -> Result<ControlFlow<()>>
+where
+    F: FnMut(NbtEvent<'a>) -> ControlFlow<()>,
+{
+    if visitor(NbtEvent::BeginCompound { name }).is_break() {
+        return Ok(ControlFlow::Break(()));
+    }
+    loop {
+        let child_type = reader.read_u8()?;
+        if child_type == TAG_END {
+            break;
+        }
+        let child_name = reader.read_string_ref()?;
+        if visit_event_payload(reader, child_type, Some(child_name), depth + 1, visitor)?.is_break()
+        {
+            return Ok(ControlFlow::Break(()));
+        }
+    }
+    Ok(visitor(NbtEvent::EndCompound))
 }
 
 struct SliceNbtReader<'a> {
@@ -1041,6 +1111,35 @@ mod tests {
                 bytes
             } if *bytes == [1, 2, 3]
         )));
+    }
+
+    #[test]
+    fn nbt_event_visitor_stops_without_materializing_remaining_events() {
+        let root = NbtTag::Compound(IndexMap::from([
+            ("Name".to_string(), NbtTag::String("Wanted".to_string())),
+            ("Seed".to_string(), NbtTag::Long(42)),
+        ]));
+        let bytes = serialize_root_nbt(&root).expect("serialize");
+        let mut visited = 0_usize;
+        let mut found = None;
+
+        NbtView::new(&bytes)
+            .visit_events(|event| {
+                visited = visited.saturating_add(1);
+                if let NbtEvent::String {
+                    name: Some("Name"),
+                    value,
+                } = event
+                {
+                    found = Some(value);
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            })
+            .expect("visit events");
+
+        assert_eq!(found, Some("Wanted"));
+        assert_eq!(visited, 2);
     }
 
     #[test]

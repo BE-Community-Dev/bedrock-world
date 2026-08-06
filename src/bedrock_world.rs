@@ -61,12 +61,13 @@ pub mod surface;
 pub mod world;
 
 pub use chunk::{
-    ActorDigestKey, ActorUid, BedrockDbKey, BlockPalette, BlockPos, BlockState, Chunk, ChunkKey,
-    ChunkPos, ChunkRecord, ChunkRecordTag, ChunkVersion, Dimension, EntityData, GlobalRecordKind,
-    LEGACY_SUBCHUNK_BLOCK_COUNT, LEGACY_SUBCHUNK_MIN_VALUE_LEN,
-    LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN, LEGACY_TERRAIN_BLOCK_COUNT, LEGACY_TERRAIN_VALUE_LEN,
-    LegacyBiomeSample, LegacySubChunk, LegacyTerrain, MapRecordId, ParsedVillageKey, SubChunk,
-    SubChunkDecodeMode, SubChunkFormat, VillageRecordKind, block_storage_index,
+    ActorDigestKey, ActorUid, BedrockDbKey, BedrockDbKeyKind, BlockPalette, BlockPos, BlockState,
+    Chunk, ChunkKey, ChunkPos, ChunkRecord, ChunkRecordTag, ChunkVersion, Dimension,
+    EncodedChunkKey, EntityData, GlobalRecordKind, LEGACY_SUBCHUNK_BLOCK_COUNT,
+    LEGACY_SUBCHUNK_MIN_VALUE_LEN, LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN,
+    LEGACY_TERRAIN_BLOCK_COUNT, LEGACY_TERRAIN_VALUE_LEN, LegacyBiomeSample, LegacySubChunk,
+    LegacyTerrain, MapRecordId, ParsedVillageKey, SubChunk, SubChunkDecodeMode, SubChunkFormat,
+    VillageRecordKind, block_storage_index,
 };
 pub use discover::{WorldDiscovery, WorldSummary, discover_worlds};
 pub use error::{BedrockWorldError, BedrockWorldErrorKind, Result};
@@ -81,7 +82,9 @@ pub use mcstructure::{
     McStructureRotation, McStructureSize, McStructureWritePhase, McStructureWriteProgress,
     McStructureWriteResult, read_mcstructure_file, write_mcstructure_file,
 };
-pub use nbt::{NbtEvent, NbtReader, NbtRef, NbtTag, NbtValue, NbtView, NbtWriter};
+pub use nbt::{
+    NbtEvent, NbtReader, NbtRef, NbtTag, NbtValue, NbtView, NbtWriter, visit_nbt_events,
+};
 pub use parsed::{
     ActorRecord, ActorResolution, ActorSource, Biome2d, Biome3d, BlockEntityRecord,
     HardcodedSpawnAreaKind, HeightMap2d, ItemStack, MapKnownFields, MapPixels, ParsedActorDigest,

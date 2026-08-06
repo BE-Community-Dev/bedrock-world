@@ -152,6 +152,18 @@ pub struct StorageScanOutcome {
     pub queue_wait_ms: u128,
     /// Number of cancellation checks performed.
     pub cancel_checks: usize,
+    /// Number of exact point lookups performed by batch APIs.
+    pub exact_gets: usize,
+    /// Number of exact point lookup batches performed.
+    pub exact_get_batches: usize,
+    /// Number of table-index cache hits.
+    pub table_index_hits: usize,
+    /// Number of table-index cache misses.
+    pub table_index_misses: usize,
+    /// Number of data-block cache hits.
+    pub data_block_hits: usize,
+    /// Number of data-block cache misses.
+    pub data_block_misses: usize,
 }
 
 impl StorageScanOutcome {
@@ -166,6 +178,12 @@ impl StorageScanOutcome {
             worker_threads: 0,
             queue_wait_ms: 0,
             cancel_checks: 0,
+            exact_gets: 0,
+            exact_get_batches: 0,
+            table_index_hits: 0,
+            table_index_misses: 0,
+            data_block_hits: 0,
+            data_block_misses: 0,
         }
     }
 
@@ -184,6 +202,18 @@ impl StorageScanOutcome {
         self.worker_threads = self.worker_threads.max(other.worker_threads);
         self.queue_wait_ms = self.queue_wait_ms.saturating_add(other.queue_wait_ms);
         self.cancel_checks = self.cancel_checks.saturating_add(other.cancel_checks);
+        self.exact_gets = self.exact_gets.saturating_add(other.exact_gets);
+        self.exact_get_batches = self
+            .exact_get_batches
+            .saturating_add(other.exact_get_batches);
+        self.table_index_hits = self.table_index_hits.saturating_add(other.table_index_hits);
+        self.table_index_misses = self
+            .table_index_misses
+            .saturating_add(other.table_index_misses);
+        self.data_block_hits = self.data_block_hits.saturating_add(other.data_block_hits);
+        self.data_block_misses = self
+            .data_block_misses
+            .saturating_add(other.data_block_misses);
     }
 }
 
@@ -840,7 +870,7 @@ pub mod backend {
                 paranoid_checks,
                 compression_policy: bedrock_leveldb::CompressionPolicy::Zlib,
                 cache_size: 64 * 1024 * 1024,
-                write_buffer_size: 0,
+                write_buffer_size: 4 * 1024 * 1024,
             };
             let db = bedrock_leveldb::Db::open(path, options).map_err(map_leveldb_error)?;
             Ok(Self { db: Arc::new(db) })
@@ -1016,11 +1046,13 @@ pub mod backend {
         }
 
         fn flush(&self) -> Result<()> {
-            Ok(())
+            self.db.flush_memtable().map_err(map_leveldb_error)
         }
 
         fn compact(&self) -> Result<()> {
-            Ok(())
+            self.db
+                .compact_range_native(None, None)
+                .map_err(map_leveldb_error)
         }
     }
 
@@ -1089,6 +1121,12 @@ pub mod backend {
             worker_threads: outcome.worker_threads,
             queue_wait_ms: outcome.queue_wait_ms,
             cancel_checks: outcome.cancel_checks,
+            exact_gets: outcome.exact_gets,
+            exact_get_batches: outcome.exact_get_batches,
+            table_index_hits: outcome.table_index_hits,
+            table_index_misses: outcome.table_index_misses,
+            data_block_hits: outcome.data_block_hits,
+            data_block_misses: outcome.data_block_misses,
         }
     }
 
@@ -1268,7 +1306,7 @@ mod tests {
                     .is_some_and(|extension| extension == "ldb")
             })
             .count();
-        assert_eq!(table_count, 0);
+        assert_eq!(table_count, 1);
 
         let reopened = backend::BedrockLevelDbStorage::open(&path).expect("reopen");
         assert_eq!(
@@ -1288,6 +1326,12 @@ mod tests {
             .expect("scan");
         assert_eq!(player_count, 2);
 
+        reopened.delete(b"player_2").expect("delete");
+        reopened.compact().expect("compact");
+        assert_eq!(reopened.get(b"player_2").expect("get deleted"), None);
+
+        drop(reopened);
+        drop(storage);
         std::fs::remove_dir_all(path).expect("cleanup");
     }
 

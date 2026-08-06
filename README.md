@@ -11,7 +11,8 @@ Bedrock `.mcstructure` file import/export helpers.
 
 The performance model is benchmark-backed rather than "femtosecond" marketing:
 hot paths avoid owned raw-value retention, use borrowed/event NBT views when a
-DOM is not needed, and keep shared cache locks opt-in.
+DOM is not needed, reuse the default index/data caches for point reads, and let
+one-shot scans bypass those caches when lock avoidance is more important.
 
 This crate focuses on complete parsing behavior. The
 `bedrock-dev/bedrock-level` project is referenced only for parsing behavior.

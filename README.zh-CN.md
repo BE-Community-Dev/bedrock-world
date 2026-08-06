@@ -7,6 +7,9 @@
 terrain record 的 chunk/subchunk 解析、实体和方块实体解析、物品提取、biome summary，
 typed map/village/global record 访问，以及 Bedrock `.mcstructure` 文件导入/导出 helper。
 
+性能设计以 benchmark 为依据：热路径避免保留 owned raw value，在不需要 DOM 时使用
+借用式/event NBT view；精确读取默认复用 index/data cache，一次性扫描则可以绕过缓存。
+
 本 crate 专注于完整解析行为；`bedrock-dev/bedrock-level` 项目仅作为解析行为参考。
 
 ## 推荐 API
