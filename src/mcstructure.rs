@@ -12,7 +12,7 @@ use crate::{
 };
 use bytes::Bytes;
 use indexmap::IndexMap;
-use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 const STRUCTURE_FORMAT_VERSION: i32 = 1;
@@ -815,6 +815,10 @@ impl McStructureFile {
     }
 
     /// Builds a structure by sampling decoded blocks from a world.
+    ///
+    /// Subchunks are decoded once and their palettes reused for every sampled
+    /// cell. Calling `Chunk::get_block` per cell re-parses the containing
+    /// subchunk on each call, which dominates large regions.
     pub fn from_world_region_blocking(
         world: &BedrockWorld,
         dimension: crate::Dimension,
@@ -826,74 +830,198 @@ impl McStructureFile {
         let mut structure = Self::new_air(size, [min_x, min_y, min_z])?;
         let mut palette_indices = HashMap::new();
         palette_indices.insert(structure.palette[0].key(), 0_i32);
-        let mut chunk_cache = HashMap::new();
 
-        for x in 0..size.x {
-            let world_x = min_x + x;
-            let chunk_x = world_x.div_euclid(16);
-            let local_x = u8::try_from(world_x.rem_euclid(16)).map_err(|_| {
-                BedrockWorldError::Validation(format!("invalid local x for block {world_x}"))
-            })?;
-            for z in 0..size.z {
-                let world_z = min_z + z;
-                let chunk_z = world_z.div_euclid(16);
-                let local_z = u8::try_from(world_z.rem_euclid(16)).map_err(|_| {
-                    BedrockWorldError::Validation(format!("invalid local z for block {world_z}"))
-                })?;
-                let chunk_pos = ChunkPos {
-                    x: chunk_x,
-                    z: chunk_z,
+        let min_x64 = i64::from(min_x);
+        let min_y64 = i64::from(min_y);
+        let min_z64 = i64::from(min_z);
+        let max_x = min_x64 + i64::from(size.x);
+        let max_y = min_y64 + i64::from(size.y);
+        let max_z = min_z64 + i64::from(size.z);
+        let min_chunk_x = min_x64.div_euclid(16);
+        let max_chunk_x = (max_x - 1).div_euclid(16);
+        let min_chunk_z = min_z64.div_euclid(16);
+        let max_chunk_z = (max_z - 1).div_euclid(16);
+
+        for chunk_x in min_chunk_x..=max_chunk_x {
+            for chunk_z in min_chunk_z..=max_chunk_z {
+                let chunk = world.get_chunk_blocking(ChunkPos {
+                    x: i32::try_from(chunk_x).map_err(|_| {
+                        BedrockWorldError::Validation("chunk x out of range".to_string())
+                    })?,
+                    z: i32::try_from(chunk_z).map_err(|_| {
+                        BedrockWorldError::Validation("chunk z out of range".to_string())
+                    })?,
                     dimension,
-                };
-                if let Entry::Vacant(entry) = chunk_cache.entry(chunk_pos) {
-                    let chunk = world.get_chunk_blocking(chunk_pos)?;
-                    entry.insert(chunk);
-                }
-                let chunk = chunk_cache.get(&chunk_pos).ok_or_else(|| {
-                    BedrockWorldError::CorruptWorld("chunk cache insert failed".to_string())
                 })?;
-                for y in 0..size.y {
-                    let world_y = min_y + y;
-                    let state = match chunk.get_block(
-                        local_x,
-                        i16::try_from(world_y).map_err(|_| {
-                            BedrockWorldError::Validation(format!(
-                                "block y={world_y} cannot be represented as i16"
-                            ))
-                        })?,
-                        local_z,
-                    ) {
-                        Ok(state) => state,
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                crate::BedrockWorldErrorKind::UnsupportedChunkFormat
-                            ) =>
-                        {
-                            BlockState {
-                                name: AIR_BLOCK_NAME.to_string(),
-                                states: BTreeMap::new(),
-                                version: Some(DEFAULT_BLOCK_VERSION),
+                let x_start = (chunk_x * 16).max(min_x64);
+                let x_end = (chunk_x * 16 + 16).min(max_x);
+                let z_start = (chunk_z * 16).max(min_z64);
+                let z_end = (chunk_z * 16 + 16).min(max_z);
+                let has_legacy = chunk
+                    .records
+                    .iter()
+                    .any(|record| record.key.tag == ChunkRecordTag::LegacyTerrain);
+                let mut decoded = HashSet::new();
+                let mut unsupported = HashSet::new();
+
+                for record in &chunk.records {
+                    if record.key.tag != ChunkRecordTag::SubChunkPrefix {
+                        continue;
+                    }
+                    let Some(subchunk_y) = record.key.subchunk_y else {
+                        continue;
+                    };
+                    let subchunk = crate::chunk::parse_subchunk(subchunk_y, record.value.clone())?;
+                    let y_base = i64::from(subchunk_y) * 16;
+                    let y_start = y_base.max(min_y64);
+                    let y_end = (y_base + 16).min(max_y);
+                    if y_start >= y_end {
+                        continue;
+                    }
+                    let SubChunkFormat::Paletted { storages, .. } = &subchunk.format else {
+                        unsupported.insert(subchunk_y);
+                        continue;
+                    };
+                    let Some(storage) = storages.first() else {
+                        continue;
+                    };
+                    decoded.insert(subchunk_y);
+                    // Intern each palette entry on first use so the exported
+                    // palette matches the per-cell sampler instead of listing
+                    // states the region never references.
+                    let mut mapping: Vec<Option<i32>> = vec![None; storage.states.len()];
+                    for world_x in x_start..x_end {
+                        let local_x = world_x.rem_euclid(16) as u8;
+                        for world_z in z_start..z_end {
+                            let local_z = world_z.rem_euclid(16) as u8;
+                            for world_y in y_start..y_end {
+                                let local_y = world_y.rem_euclid(16) as u8;
+                                let Some(palette_index) =
+                                    storage.palette_index_at(local_x, local_y, local_z)
+                                else {
+                                    continue;
+                                };
+                                let palette_index = usize::from(palette_index);
+                                let Some(state) = storage.states.get(palette_index) else {
+                                    continue;
+                                };
+                                let palette_id = match mapping[palette_index] {
+                                    Some(existing) => existing,
+                                    None => {
+                                        let entry =
+                                            McStructurePaletteEntry::from_block_state(state);
+                                        let key = entry.key();
+                                        let id = if let Some(existing) = palette_indices.get(&key)
+                                        {
+                                            *existing
+                                        } else {
+                                            let new_index = i32::try_from(structure.palette.len())
+                                                .map_err(|_| {
+                                                    BedrockWorldError::Validation(
+                                                        "mcstructure palette length exceeds i32"
+                                                            .to_string(),
+                                                    )
+                                                })?;
+                                            structure.palette.push(entry);
+                                            palette_indices.insert(key, new_index);
+                                            new_index
+                                        };
+                                        mapping[palette_index] = Some(id);
+                                        id
+                                    }
+                                };
+                                let block_index = size.index(
+                                    i32::try_from(world_x - min_x64).map_err(|_| {
+                                        BedrockWorldError::Validation(
+                                            "block x out of range".to_string(),
+                                        )
+                                    })?,
+                                    i32::try_from(world_y - min_y64).map_err(|_| {
+                                        BedrockWorldError::Validation(
+                                            "block y out of range".to_string(),
+                                        )
+                                    })?,
+                                    i32::try_from(world_z - min_z64).map_err(|_| {
+                                        BedrockWorldError::Validation(
+                                            "block z out of range".to_string(),
+                                        )
+                                    })?,
+                                )?;
+                                structure.primary_indices[block_index] = palette_id;
                             }
                         }
-                        Err(error) => return Err(error),
-                    };
-                    let entry = McStructurePaletteEntry::from_block_state(&state);
-                    let key = entry.key();
-                    let palette_index = if let Some(existing) = palette_indices.get(&key) {
-                        *existing
-                    } else {
-                        let new_index = i32::try_from(structure.palette.len()).map_err(|_| {
-                            BedrockWorldError::Validation(
-                                "mcstructure palette length exceeds i32".to_string(),
-                            )
-                        })?;
-                        structure.palette.push(entry);
-                        palette_indices.insert(key, new_index);
-                        new_index
-                    };
-                    let block_index = size.index(x, y, z)?;
-                    structure.primary_indices[block_index] = palette_index;
+                    }
+                }
+
+                // Missing subchunks are air in modern worlds. Legacy terrain and
+                // non-paletted subchunks keep the slower per-cell fallback.
+                if has_legacy || !unsupported.is_empty() {
+                    for world_x in x_start..x_end {
+                        let local_x = world_x.rem_euclid(16) as u8;
+                        for world_z in z_start..z_end {
+                            let local_z = world_z.rem_euclid(16) as u8;
+                            for world_y in min_y64..max_y {
+                                let Ok(subchunk_y) =
+                                    i8::try_from(world_y.div_euclid(16))
+                                else {
+                                    continue;
+                                };
+                                if decoded.contains(&subchunk_y) {
+                                    continue;
+                                }
+                                let Ok(block_y) = i16::try_from(world_y) else {
+                                    continue;
+                                };
+                                let state = match chunk.get_block(local_x, block_y, local_z) {
+                                    Ok(state) => state,
+                                    Err(error)
+                                        if matches!(
+                                            error.kind(),
+                                            crate::BedrockWorldErrorKind::UnsupportedChunkFormat
+                                        ) =>
+                                    {
+                                        continue;
+                                    }
+                                    Err(error) => return Err(error),
+                                };
+                                let entry = McStructurePaletteEntry::from_block_state(&state);
+                                let key = entry.key();
+                                let palette_index =
+                                    if let Some(existing) = palette_indices.get(&key) {
+                                        *existing
+                                    } else {
+                                        let new_index =
+                                            i32::try_from(structure.palette.len()).map_err(|_| {
+                                                BedrockWorldError::Validation(
+                                                    "mcstructure palette length exceeds i32"
+                                                        .to_string(),
+                                                )
+                                            })?;
+                                        structure.palette.push(entry);
+                                        palette_indices.insert(key, new_index);
+                                        new_index
+                                    };
+                                let block_index = size.index(
+                                    i32::try_from(world_x - min_x64).map_err(|_| {
+                                        BedrockWorldError::Validation(
+                                            "block x out of range".to_string(),
+                                        )
+                                    })?,
+                                    i32::try_from(world_y - min_y64).map_err(|_| {
+                                        BedrockWorldError::Validation(
+                                            "block y out of range".to_string(),
+                                        )
+                                    })?,
+                                    i32::try_from(world_z - min_z64).map_err(|_| {
+                                        BedrockWorldError::Validation(
+                                            "block z out of range".to_string(),
+                                        )
+                                    })?,
+                                )?;
+                                structure.primary_indices[block_index] = palette_index;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1790,6 +1918,88 @@ mod tests {
         assert_eq!(parsed.palette.len(), 2);
         assert_eq!(parsed.primary_index_at(1, 2, 3).expect("primary"), 1);
         assert_eq!(parsed.primary_index_at(0, 0, 0).expect("air"), 0);
+    }
+
+    #[test]
+    fn world_region_export_matches_written_blocks() {
+        let size = McStructureSize::new(16, 16, 16).expect("valid size");
+        let mut source = McStructureFile::new_air(size, [0, 0, 0]).expect("air structure");
+        source.palette.push(McStructurePaletteEntry {
+            name: "minecraft:stone".to_string(),
+            states: BTreeMap::new(),
+            version: Some(1),
+        });
+        source.palette.push(McStructurePaletteEntry {
+            name: "minecraft:glass".to_string(),
+            states: BTreeMap::new(),
+            version: Some(1),
+        });
+        for (x, y, z, id) in [(1, 2, 3, 1), (5, 6, 7, 2), (15, 0, 15, 1)] {
+            let index = size.index(x, y, z).expect("index");
+            source.primary_indices[index] = id;
+        }
+
+        let world = BedrockWorld::from_storage(
+            "memory",
+            Arc::new(MemoryStorage::new()),
+            OpenOptions {
+                read_only: false,
+                ..OpenOptions::default()
+            },
+        );
+        let guard = WriteGuard::confirmed("memory", "region export test");
+        source
+            .write_to_world_blocking(
+                &world,
+                McStructurePlacement {
+                    source_anchor: ChunkPos {
+                        x: 0,
+                        z: 0,
+                        dimension: Dimension::Overworld,
+                    },
+                    target_anchor: ChunkPos {
+                        x: 0,
+                        z: 0,
+                        dimension: Dimension::Overworld,
+                    },
+                    origin_y: 0,
+                    rotation: McStructureRotation::None,
+                    mirror_x: false,
+                    mirror_z: false,
+                },
+                &guard,
+                |_| {},
+            )
+            .expect("write structure");
+
+        let exported = McStructureFile::from_world_region_blocking(
+            &world,
+            Dimension::Overworld,
+            0,
+            0,
+            0,
+            size,
+        )
+        .expect("export region");
+        for x in 0..size.x {
+            for y in 0..size.y {
+                for z in 0..size.z {
+                    let expected = source
+                        .palette_entry_or_air(
+                            source.primary_index_at(x, y, z).expect("source index"),
+                        )
+                        .name;
+                    let actual = exported
+                        .palette_entry_or_air(
+                            exported
+                                .primary_index_at(x, y, z)
+                                .expect("exported index"),
+                        )
+                        .name;
+                    assert_eq!(actual, expected, "block ({x},{y},{z})");
+                }
+            }
+        }
     }
 
     #[test]
